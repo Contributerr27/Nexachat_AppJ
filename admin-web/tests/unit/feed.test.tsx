@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import FeedPage from '../../src/pages/FeedPage';
 import { I18nProvider } from '../../src/i18n';
@@ -309,6 +309,28 @@ describe('FeedPage', () => {
     expect(screen.queryByRole('navigation', { name: 'Pagination' })).toBeNull();
   });
 
+  it('clears the action error banner after a successful reload', async () => {
+    const user = userEvent.setup();
+    apiMock.mockResolvedValueOnce(page([report()]));
+    renderPage();
+    expect(await screen.findByText('Mai')).toBeInTheDocument();
+
+    apiMock.mockRejectedValueOnce(new ApiException(500, 'X', 'boom'));
+    await user.click(screen.getByRole('button', { name: 'Mark reviewed' }));
+    const dialog = screen.getByRole('alertdialog', { name: 'Mark reviewed' });
+    await user.click(within(dialog).getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong');
+
+    // The banner's own retry reloads the list: once that succeeds the banner
+    // must not linger over data that is no longer failing.
+    apiMock.mockResolvedValueOnce(page([report()]));
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('switches the status filter and reloads from page 0', async () => {
     const user = userEvent.setup();
     apiMock.mockResolvedValue(page([report()]));
@@ -339,6 +361,35 @@ describe('FeedPage', () => {
 
     resolveSecond(page([report({ id: 'r2', status: 'DISMISSED', authorName: 'Lan' })]));
     expect(await screen.findByText('Lan')).toBeInTheDocument();
+  });
+
+  it('keeps the freshest status results when an older response resolves late', async () => {
+    const user = userEvent.setup();
+    const stale: { resolve?: (value: Page<FeedReport>) => void } = {};
+    apiMock.mockImplementation((path: string) => {
+      if (path.startsWith('/api/v1/admin/feed/reports?')) {
+        return path.includes('status=DISMISSED')
+          ? Promise.resolve(page([report({ id: 'r2', authorName: 'Lan' })]))
+          : new Promise<Page<FeedReport>>((resolve) => {
+              stale.resolve = resolve;
+            });
+      }
+      return Promise.reject(new ApiException(404, 'NO_ROUTE', `unstubbed ${path}`));
+    });
+    renderPage();
+
+    // The OPEN request is still in flight when the status changes; the
+    // DISMISSED response must win even though it lands first.
+    await user.selectOptions(screen.getByLabelText('Status'), 'DISMISSED');
+    expect(await screen.findByText('Lan')).toBeInTheDocument();
+
+    // Let the stale response land and any wrong re-render settle first.
+    stale.resolve?.(page([report()]));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(screen.queryByText('Mai')).toBeNull();
+    expect(screen.getByText('Lan')).toBeInTheDocument();
   });
 
   it('closes the expanded detail of a same-id report after the status filter changes', async () => {
