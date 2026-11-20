@@ -119,6 +119,7 @@ public final class ItPhoneRanges {
             Map.entry("com.nexachat.translate.TranslationSuppressionIT", "+84892"),
             Map.entry("com.nexachat.translate.TranslateRequestLimitRepositoryIT", "+84893"),
             Map.entry("com.nexachat.conversation.GroupMemberCapBoundaryIT", "+84894"),
+            Map.entry("com.nexachat.translate.TranslateTxRollbackIT", "+84895"),
             // Brief 375 owns these two suites. AskApiIT inserts "+849" + 9 digits, and
             // SearchTrigramIndexIT keeps "+8493". Neither file is edited here, so every
             // other suite uses a +848xx range that overlaps neither stem.
