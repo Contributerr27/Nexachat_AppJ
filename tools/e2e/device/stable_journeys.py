@@ -1366,17 +1366,32 @@ def run_chat_send_receive(row: JourneyRow, context: dict[str, Any]) -> dict[str,
             raise ProductFailure("device did not render its sent chat message") from error
         ui.screenshot(str(context["row_dir"] / "chat-after-send.png"))
 
-        page_response = recorder.get(
-            f"/api/v1/conversations/{conversation_id}/messages",
-            token=binh["accessToken"], params={"limit": 50},
-        )
-        if page_response.status != 200:
-            raise ProductFailure(f"peer REST history returned HTTP {page_response.status}")
-        page = page_response.json() or {}
-        items = page.get("items") or []
-        matching = [item for item in items if item.get("content") == outbound]
-        if len(matching) != 1:
-            raise ProductFailure("peer REST history did not contain exactly one device message")
+        # The device send flushes through the outbox worker, which can sit
+        # behind a large inbox resync after a cold start. Poll the peer's REST
+        # history for a bounded window instead of a single immediate read, then
+        # keep the exact-one assertion on the converged page.
+        matching: list[dict[str, Any]] = []
+        last_status: int | None = None
+        deadline = time.monotonic() + 45
+        while True:
+            page_response = recorder.get(
+                f"/api/v1/conversations/{conversation_id}/messages",
+                token=binh["accessToken"], params={"limit": 50},
+            )
+            last_status = page_response.status
+            if page_response.status == 200:
+                page = page_response.json() or {}
+                items = page.get("items") or []
+                matching = [item for item in items if item.get("content") == outbound]
+                if len(matching) == 1:
+                    break
+                if len(matching) > 1:
+                    raise ProductFailure("peer REST history contained duplicate copies of the device message")
+            if time.monotonic() >= deadline:
+                if last_status != 200:
+                    raise ProductFailure(f"peer REST history returned HTTP {last_status}")
+                raise ProductFailure("peer REST history did not contain exactly one device message")
+            time.sleep(2)
         outbound_id = str(matching[0].get("id", ""))
         if outbound_id:
             created.append((an, outbound_id))
@@ -1477,11 +1492,57 @@ def _rid_ends(node: Any, suffix: str) -> bool:
     return str(getattr(node, "attrs", {}).get("resource-id", "") or "").endswith("/" + suffix)
 
 
+_ANR_TITLE_MARKERS = ("isn't responding", "Not Responding", "không phản hồi")
+_ANR_WAIT_LABELS = ("Wait", "Đợi")
+
+
+def _dismiss_occluder(context: dict[str, Any], nodes: list[Any]) -> bool:
+    """Dismiss any modal surface that hides the app's real tree.
+
+    Two occluders are handled here: system ANR dialogs and the app's own
+    StreakMilestoneSheet, which pops over the inbox when a streak increments
+    mid-journey and leaves every wait polling a 'Keep it going' sheet instead
+    of the conversation list (run-50 attempt-2 froze the walk for ~40min)."""
+    if _dismiss_anr_dialog(context, nodes):
+        return True
+    done = next((node for node in nodes
+                 if _rid_ends(node, "streakMilestoneDone") and node.clickable),
+                None)
+    if done is not None:
+        context["device"].tap_node(done)
+        return True
+    return False
+
+
+def _dismiss_anr_dialog(context: dict[str, Any], nodes: list[Any]) -> bool:
+    """Tap 'Wait' on a system 'not responding' dialog occluding the app.
+
+    The debug build and SystemUI both ANR under the seeded burst load; while
+    the dialog is up every node probe sees only its tiny tree and the wait
+    budget burns out on an occluded surface (run-14: 'System UI isn't
+    responding' ate the whole device-account restore window)."""
+    if not any(any(marker in (node.text or "") or marker in (node.desc or "")
+                   for marker in _ANR_TITLE_MARKERS)
+               for node in nodes):
+        return False
+    wait = next((node for node in nodes
+                 if node.text.strip() in _ANR_WAIT_LABELS
+                 and node.clickable and node.box), None)
+    if wait is None:
+        return False
+    context["device"].tap_node(wait)
+    return True
+
+
 def _wait_ui_node(context: dict[str, Any], predicate: Callable[[Any], bool],
                   what: str, timeout: float | None = None) -> Any:
     deadline = time.monotonic() + float(timeout or _ui_timeout(context))
     while True:
-        match = next((node for node in _ui_nodes(context) if predicate(node)), None)
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        match = next((node for node in nodes if predicate(node)), None)
         if match is not None:
             return match
         if time.monotonic() >= deadline:
@@ -1493,7 +1554,11 @@ def _wait_ui_absent(context: dict[str, Any], predicate: Callable[[Any], bool],
                   what: str, timeout: float | None = None) -> None:
     deadline = time.monotonic() + float(timeout or _ui_timeout(context))
     while True:
-        if not any(predicate(node) for node in _ui_nodes(context)):
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        if not any(predicate(node) for node in nodes):
             return
         if time.monotonic() >= deadline:
             raise ProductFailure(what)
@@ -1654,7 +1719,8 @@ def run_chat_interactions(row: JourneyRow, context: dict[str, Any]) -> dict[str,
     an_user_id = str((an.get("user") or {}).get("id") or "")
 
     # Resolve the seeded forward target by title — the UUID is never embedded.
-    inbox = recorder.get("/api/v1/conversations", token=an["accessToken"], params={"limit": 50})
+    # Unpaged on purpose: stale run leftovers push the seed group past page 1.
+    inbox = recorder.get("/api/v1/conversations", token=an["accessToken"])
     if inbox.status != 200:
         raise EnvironmentFailure(f"conversation inbox returned HTTP {inbox.status}")
     inbox_body = inbox.json() or []
@@ -2082,9 +2148,17 @@ def _ask_cited_ids(payload: dict[str, Any]) -> list[str]:
 
 
 def _wait_summary_ready(context: dict[str, Any]) -> Any:
-    """Wait for the summary sheet's READY body; report the last visible error."""
+    """Wait for the summary sheet's READY body; report the last visible error.
+
+    Bullet rows render inside `summarySheetScroll`; uiautomator prunes the
+    rows sitting below the sheet's inner viewport, so a valid summary with
+    its bullets below the fold reports "no content" forever. The sheet is
+    paged down each round like `_summary_citation_chip` already does.
+    """
+    ui = context["device"]
     deadline = time.monotonic() + _ASK_RESULT_TIMEOUT
     last_error = ""
+    seen_header = None
     while True:
         nodes = _ui_nodes(context)
         bullets = [node for node in nodes
@@ -2092,8 +2166,14 @@ def _wait_summary_ready(context: dict[str, Any]) -> Any:
         header = next((node for node in nodes
                        if _rid_ends(node, "summaryResultHeader")
                        and node.text.strip() and _node_visible(node)), None)
-        if bullets and header is not None:
-            return header
+        # Scrolling to expose bullets expands the sheet and slides the header
+        # above the viewport — header and bullets are never co-visible on a
+        # filled sheet. Latch the header at first sight (the collapsed sheet
+        # always opens with it at the top) and return it once bullets appear.
+        if header is not None:
+            seen_header = header
+        if bullets and seen_header is not None:
+            return seen_header
         error = next((node for node in nodes
                       if _rid_ends(node, "summaryErrorText")
                       and node.text.strip() and _node_visible(node)), None)
@@ -2101,6 +2181,13 @@ def _wait_summary_ready(context: dict[str, Any]) -> Any:
         if time.monotonic() >= deadline:
             detail = f" (error card: {last_error!r})" if last_error else ""
             raise ProductFailure(f"the LOCAL summary did not render its content{detail}")
+        scroll = next((node for node in nodes
+                       if _rid_ends(node, "summarySheetScroll")), None)
+        if scroll is not None:
+            box = getattr(scroll, "box", None) or (0, 0, 320, 640)
+            ui.swipe((box[0] + box[2]) // 2, box[3] - 30,
+                     (box[0] + box[2]) // 2, box[1] + (box[3] - box[1]) // 3,
+                     350)
         time.sleep(0.5)
 
 
@@ -2628,14 +2715,28 @@ def _open_chat_menu(context: dict[str, Any], item_labels: tuple[str, ...]) -> No
     _tap_dialog_item(context, item_labels)
 
 
-def _inbox_conversation_row(context: dict[str, Any], title: str) -> Any | None:
+def _inbox_conversation_row(context: dict[str, Any], title: str | tuple,
+                            nodes: list | None = None) -> Any | None:
     """Title/avatar node of a conversation row INSIDE the conversationList.
 
     The 'Active now' presence strip also renders a 'Binh' label when the peer
     is online, so a bare text match long-presses the strip instead of the row.
     Constrain the match to nodes inside the conversationList bounds.
+
+    `title` may be a tuple of accepted aliases: run-31 attempt-1 rendered the
+    seeded DM's row title as the just-delivered last-message content
+    ("sj-osp-<tag>") instead of the peer name — the row was present, bumped to
+    the top with its unread badge, and self-healed on the next inbox fetch.
+    Matching the expected message text still identifies the same row
+    unambiguously (only that conversation can display it).
+
+    `nodes` lets a wait loop reuse the dump it already fetched — three
+    uiautomator dumps per iteration made the page-down sweep too slow to
+    reach deep rows inside one timeout window (run-36: ~106 stale rows).
     """
-    nodes = _ui_nodes(context)
+    titles = (title,) if isinstance(title, str) else tuple(title)
+    if nodes is None:
+        nodes = _ui_nodes(context)
     container = next((node for node in nodes
                       if _rid_ends(node, "conversationList")), None)
     if container is None or not container.box:
@@ -2646,7 +2747,7 @@ def _inbox_conversation_row(context: dict[str, Any], title: str) -> Any | None:
         return None
     top, bottom = container.box[1], container.box[3]
     for node in nodes:
-        if node.text.strip() != title and node.desc.strip() != title:
+        if node.text.strip() not in titles and node.desc.strip() not in titles:
             continue
         if node.box and top <= node.box[1] and node.box[3] <= bottom:
             return node
@@ -2658,6 +2759,12 @@ def _open_inbox_actions(context: dict[str, Any]) -> None:
     ui = context["device"]
     deadline = time.monotonic() + _ui_timeout(context)
     while True:
+        # Sweep below the rendered viewport — a low-sorted peer row is
+        # otherwise invisible to the a11y dump (labels-lifecycle attempt-1).
+        if not _inbox_row_found_scrolled(context, "Binh"):
+            if time.monotonic() >= deadline:
+                raise ProductFailure("the seeded peer row was not on the inbox")
+            continue
         row = _inbox_conversation_row(context, "Binh")
         if row is None:
             if time.monotonic() >= deadline:
@@ -2680,11 +2787,12 @@ def _wait_binh_row(context: dict[str, Any], present: bool, what: str,
     if present:
         deadline = time.monotonic() + float(timeout or _ui_timeout(context))
         while True:
-            if _inbox_conversation_row(context, "Binh") is not None:
+            # A restored row can sort below the rendered viewport — sweep
+            # the list before declaring the wait failed (run-archprefs-10).
+            if _inbox_row_found_scrolled(context, "Binh"):
                 return
             if time.monotonic() >= deadline:
                 raise ProductFailure(what)
-            time.sleep(0.4)
     else:
         deadline = time.monotonic() + float(timeout or _ui_timeout(context))
         while True:
@@ -2726,6 +2834,36 @@ def _scroll_list_to_top(context: dict[str, Any], container_rid: str,
         height = box[3] - box[1]
         ui.swipe(cx, box[1] + int(height * 0.30), cx, box[3] - int(height * 0.12), 300)
         time.sleep(0.5)
+
+
+def _inbox_row_found_scrolled(context: dict[str, Any], title: str | tuple,
+                              swipes: int = 5) -> bool:
+    """Sweep the conversationList downward looking for a row title.
+
+    `_inbox_conversation_row` only sees rendered nodes — a restored or
+    low-sorted row below the ~4-row viewport reports absent forever
+    (run-archprefs-verify-10: the un-archived Binh row sorted last and the
+    row check timed out below the fold). Each round dumps once per
+    viewport and pages down; when the sweep is exhausted the list is
+    scrolled back to the top so the next wait round starts stable.
+    """
+    ui = context["device"]
+    for _ in range(swipes):
+        nodes = _ui_nodes(context)
+        if _inbox_conversation_row(context, title, nodes) is not None:
+            return True
+        container = next((node for node in nodes
+                          if _rid_ends(node, "conversationList")), None)
+        if container is None:
+            break
+        box = getattr(container, "box", None) or (0, 0, 320, 640)
+        cx = (box[0] + box[2]) // 2
+        height = box[3] - box[1]
+        ui.swipe(cx, box[3] - int(height * 0.12), cx,
+                 box[1] + int(height * 0.30), 300)
+        time.sleep(0.5)
+    _scroll_list_to_top(context, "conversationList")
+    return False
 
 
 def _pull_to_refresh(context: dict[str, Any]) -> None:
@@ -3138,10 +3276,13 @@ def run_archive_preferences(row: JourneyRow, context: dict[str, Any]) -> dict[st
         if not snackbar_seen:
             raise ProductFailure(
                 "the archive snackbar did not render after the overflow archive")
-        ui.screenshot(str(row_dir / "archive-snackbar.png"))
         if undo is None:
             raise ProductFailure("the archive snackbar did not offer Undo")
+        # Tap before the screenshot: the snackbar's ~3s TTL can expire inside
+        # one dump+capture window on a slow bridge, and a stale Undo tap then
+        # lands on whatever surfaced underneath (run-sweep-verify-12).
         ui.tap_node(undo)
+        ui.screenshot(str(row_dir / "archive-snackbar.png"))
         _wait_inbox_entry(
             recorder, an["accessToken"], conversation_id,
             lambda entry: entry is not None and entry.get("archived") is False,
@@ -3150,7 +3291,8 @@ def run_archive_preferences(row: JourneyRow, context: dict[str, Any]) -> dict[st
                          "An's archive leaked into Binh's inbox entry")
         _wait_binh_row(
             context, True,
-            "the conversation row did not return to the inbox after Undo")
+            "the conversation row did not return to the inbox after Undo",
+            timeout=60.0)
         result["archive_undo"] = ("overflow archive persisted caller-side; the "
                                   "snackbar's Undo action reverted it")
 
@@ -3855,13 +3997,16 @@ def run_labels_lifecycle(row: JourneyRow, context: dict[str, Any]) -> dict[str, 
             lambda node: node.text.strip() in _LBL_FILTER_ALL and not node.desc.strip(),
             "the 'All labels' filter chip never appeared")
         ui.tap_node(all_chip)
-        deadline = time.monotonic() + _ui_timeout(context)
-        while not _inbox_row_visible(context, "NexaChat Team"):
+        # Delta-sync restore plus a full scroll sweep can exceed the stock UI
+        # timeout on a loaded bridge — rows return on their own, just late
+        # (run-sweep-verify-13: Binh present in both post-failure captures).
+        deadline = time.monotonic() + 60.0
+        while not _inbox_row_found_scrolled(context, "NexaChat Team"):
             if time.monotonic() >= deadline:
                 raise ProductFailure("unlabeled rows did not return after 'All labels'")
-            time.sleep(0.4)
-        if not _inbox_row_visible(context, "Binh"):
-            raise ProductFailure("the labeled row did not return after 'All labels'")
+        while not _inbox_row_found_scrolled(context, "Binh"):
+            if time.monotonic() >= deadline:
+                raise ProductFailure("the labeled row did not return after 'All labels'")
         result["unfilter"] = "All labels restores the full inbox"
 
         # === phase 4: dialog recreation — rotation + stop/start =============
@@ -4214,6 +4359,18 @@ def _remove_member_rest(recorder: RecordingClient, token: str, conversation_id: 
                         user_id: str) -> None:
     response = recorder.delete(
         f"/api/v1/conversations/{conversation_id}/members/{user_id}", token=token)
+    for _attempt in range(2):
+        if response.status != 429:
+            break
+        details = ((response.json() or {}).get("error") or {}).get("details") or {}
+        try:
+            retry_after = int(details.get("retryAfterSeconds") or 5)
+        except (TypeError, ValueError):
+            retry_after = 5
+        time.sleep(min(30, max(2, retry_after + 1)))
+        response = recorder.delete(
+            f"/api/v1/conversations/{conversation_id}/members/{user_id}",
+            token=token)
     _expect_status(response, {200, 204, 403, 404},
                    f"remove member {user_id}")
 
@@ -5486,8 +5643,12 @@ def run_polls_reminders(row: JourneyRow, context: dict[str, Any]) -> dict[str, A
         try:
             due = clock.make_due(reminder_id, minutes_ago=1)
         except Exception as error:
+            hint = (" (reminder row missing from the target db? set "
+                    "NEXACHAT_E2E_REMINDER_DB to the stack's database)"
+                    if "UPDATE 0" in str(error)
+                    or "not found" in str(error).lower() else "")
             raise EnvironmentFailure(
-                f"reminder_clock could not pull the row due: {error}") from error
+                f"reminder_clock could not pull the row due: {error}{hint}") from error
         if due.get("status") not in ("DUE", "CLAIMED", "FIRED"):
             raise EnvironmentFailure(f"make_due left the reminder {due.get('status')!r}")
         try:
@@ -5697,13 +5858,21 @@ def run_polls_reminders(row: JourneyRow, context: dict[str, Any]) -> dict[str, A
 _OFFLINE_GROUP_COUNT = 105      # pushes the caller's conversation set past 100
 _OFFLINE_SEEN_MIN = 100         # rendered rows the paged inbox walk must surface
 _OFFLINE_FIXTURE_EACH = 30      # 30 edits + 30 recalls = 60 reconciled changes
-_OFFLINE_SEND_GAP_S = 0.4       # keeps fixture sends under the write rate bucket
+# Each STOMP MessageCreated frame also queues a full page-1 inbox refresh on
+# the device; a ~2 msg/s REST burst serialized ~60 refreshes and pegged the
+# debug app at >130% CPU until the system showed its ANR dialog (run-6
+# attempt-1 logcat). ~1 msg/s stays far under the write rate bucket while
+# letting each refresh finish before the next push lands.
+_OFFLINE_SEND_GAP_S = 1.2       # keeps fixture sends under the write rate bucket
 # OkHttp Level.BASIC logs "--> POST <url> (<bytes>-byte body)"; ~100 watermarks
 # cannot fit inside a body smaller than this floor.
 _OFFLINE_SYNC_POST_RE = re.compile(r"--> POST \S+/api/v1/sync")
 _OFFLINE_SYNC_BYTES_RE = re.compile(r"--> POST \S+/api/v1/sync[^\n]*?\((\d+)-byte body\)")
 _OFFLINE_FULL_BATCH_BYTES = 3000
 _OFFLINE_SIGN_OUT_LABELS = ("Sign out", "Đăng xuất")
+_OFFLINE_RETRY_LABELS = ("Retry", "Thử lại")
+_OFFLINE_SYNC_POLL_S = 180.0
+_OFFLINE_ROW_SWEEP_LIMIT = 56  # ~1-viewport page-downs per inbox row scan cycle
 
 
 # --- accessibility-sweep ------------------------------------------------------
@@ -5743,6 +5912,11 @@ def _offline_rest_once(make_call: Callable[[], Any], allowed: set[int],
     """One REST fixture call; a single 429 retry keeps the seeded write burst
     honest, and a second rate-limit is an environment signal, not a defect."""
     response = make_call()
+    if response.status == 401:
+        # Seed access tokens expire inside the >40-minute journey; every call
+        # site resolves them through _tok per invocation, so a plain retry
+        # lands on a fresh session (run-25 attempt-1 died on a stale token).
+        response = make_call()
     if response.status == 429:
         details = ((response.json() or {}).get("error") or {}).get("details") or {}
         try:
@@ -5757,38 +5931,49 @@ def _offline_rest_once(make_call: Callable[[], Any], allowed: set[int],
     return response
 
 
-def _offline_send_rest(recorder: RecordingClient, token: str,
+def _offline_send_rest(recorder: RecordingClient,
+                       tok: Callable[[], str],
                        conversation_id: str, content: str) -> dict[str, Any]:
     response = _offline_rest_once(
         lambda: recorder.post(
-            f"/api/v1/conversations/{conversation_id}/messages", token=token,
+            f"/api/v1/conversations/{conversation_id}/messages", token=tok(),
             body={"clientMessageId": str(uuid.uuid4()), "type": "TEXT",
                   "content": content, "attachmentIds": []}),
         {200, 201}, f"fixture send of {content!r}")
     return dict(response.json() or {})
 
 
-def _offline_history(recorder: RecordingClient, token: str,
+def _offline_history(recorder: RecordingClient,
+                     tok: Callable[[], str],
                      conversation_id: str) -> list[dict[str, Any]]:
     """Newest 100 history rows — the 60-fixture burst stays inside one page."""
-    response = recorder.get(
-        f"/api/v1/conversations/{conversation_id}/messages",
-        token=token, params={"limit": 100})
+    def call():
+        return recorder.get(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            token=tok(), params={"limit": 100})
+    response = call()
+    if response.status == 401:
+        response = call()
     _expect_status(response, {200}, "the direct-conversation history")
     return list((response.json() or {}).get("items") or [])
 
 
-def _offline_inbox_ids(recorder: RecordingClient, token: str) -> set[str]:
+def _offline_inbox_ids(recorder: RecordingClient,
+                       tok: Callable[[], str]) -> set[str]:
     """Every unarchived conversation id in the caller's REST inbox."""
-    response = recorder.get("/api/v1/conversations", token=token,
+    def call():
+        return recorder.get("/api/v1/conversations", token=tok(),
                             params={"archived": "false"})
+    response = call()
+    if response.status == 401:
+        response = call()
     _expect_status(response, {200}, "the caller inbox list")
     body = response.json() or []
     items = body.get("items") if isinstance(body, dict) else body
     return {str(item.get("id")) for item in items or [] if item.get("id")}
 
 
-def _offline_chunk_tail(recorder: RecordingClient, token: str,
+def _offline_chunk_tail(recorder: RecordingClient, tok: Callable[[], str],
                         seeded_ids: set[str]) -> str:
     """The seeded group id sorting deepest in the caller's conversation set.
 
@@ -5796,7 +5981,7 @@ def _offline_chunk_tail(recorder: RecordingClient, token: str,
     POST /api/v1/sync, so an id past position 100 cannot ride in the first
     batch; a marker landing there proves the second batch was applied.
     """
-    ids = sorted(_offline_inbox_ids(recorder, token))
+    ids = sorted(_offline_inbox_ids(recorder, tok))
     if len(ids) <= 100:
         raise EnvironmentFailure(
             f"the caller inbox holds {len(ids)} conversations; >100 are required")
@@ -5805,6 +5990,45 @@ def _offline_chunk_tail(recorder: RecordingClient, token: str,
     if not tail:
         raise EnvironmentFailure("no seeded group sorts into the second sync batch")
     return tail[-1]
+
+
+def _offline_server_reachable(context: dict[str, Any]) -> bool:
+    """TCP probe from inside the emulator to the configured API endpoint.
+
+    `nc -z` on the ranchu image prints nothing and exits 0 on connect; any
+    `nc:` diagnostic means the device-side route to the server is down."""
+    parsed = urlsplit(derive_emulator_base_url(str(context.get("base_url") or "")))
+    host = parsed.hostname or "10.0.2.2"
+    port = str(parsed.port or (443 if parsed.scheme == "https" else 80))
+    probe = context["adb"].command(
+        "shell", "nc", "-z", "-w", "3", host, port,
+        timeout=15, check=False)
+    return "nc:" not in probe and "unreachable" not in probe.casefold() \
+        and "refused" not in probe.casefold()
+
+
+def _offline_wait_network(context: dict[str, Any], what: str,
+                          timeout: float = 90) -> None:
+    """Wait for the emulator's route to the API to come back.
+
+    The virtwifi radio re-associates slowly after svc toggles and has died
+    outright under the seeded-storm load (run-16 attempt-2: 'No connection'
+    for the whole ~15-minute walk while host-side REST seeding was healthy).
+    One svc re-enable is allowed; a still-dead route is an environment
+    failure, not a product defect."""
+    deadline = time.monotonic() + timeout
+    recovered = False
+    while time.monotonic() < deadline:
+        if _offline_server_reachable(context):
+            return
+        if not recovered:
+            context["adb"].command("shell", "svc", "wifi", "enable",
+                                   timeout=15, check=False)
+            context["adb"].command("shell", "svc", "data", "enable",
+                                   timeout=15, check=False)
+            recovered = True
+        time.sleep(3)
+    raise EnvironmentFailure(what)
 
 
 def _offline_force_stop(context: dict[str, Any]) -> None:
@@ -5817,59 +6041,320 @@ def _offline_relaunch(context: dict[str, Any]) -> None:
     time.sleep(4)
 
 
+def _offline_app_foreground(context: dict[str, Any]) -> bool:
+    """True when the focused window belongs to the app — the node tree alone
+    cannot tell a mid-app surface from the launcher."""
+    focus = context["adb"].command("shell", "dumpsys", "window",
+                                   timeout=20, check=False)
+    for line in focus.splitlines():
+        if "mCurrentFocus" in line:
+            return f"{PACKAGE}/" in line
+    return True
+
+
 def _offline_wait_inbox(context: dict[str, Any], what: str,
                         timeout: float | None = None) -> None:
-    _wait_ui_node(context, lambda node: _rid_ends(node, "inboxUserAvatar"),
-                  what, timeout=timeout)
+    # Accept either inbox marker: the avatar node only becomes a11y-visible
+    # after the signed-in profile binds, while conversationList attaches with
+    # the fragment. Both rids exist only in fragment_inbox.xml, so matching
+    # either still proves the inbox surface is up (run-48 attempt-2 rendered
+    # the inbox for ~180s without the avatar node appearing in the tree).
+    _wait_ui_node(
+        context,
+        lambda node: _rid_ends(node, "inboxUserAvatar")
+        or _rid_ends(node, "conversationList"),
+        what, timeout=timeout)
 
 
-def _offline_wait_inbox_row(context: dict[str, Any], title: str, what: str,
+def _offline_wait_inbox_row(context: dict[str, Any], title: str | tuple,
+                            what: str,
                             timeout: float | None = None) -> Any:
     """Pull-refresh the inbox until a title row renders, then return it."""
-    deadline = time.monotonic() + float(timeout or _ui_timeout(context))
+    deadline = time.monotonic() + float(timeout or max(90.0, _ui_timeout(context)))
+    last_pull = 0.0
+    sweeps = 0
     while True:
-        row = _inbox_conversation_row(context, title)
-        if row is not None:
-            return row
         if time.monotonic() >= deadline:
             raise ProductFailure(what)
-        _pull_refresh_inbox(context)
-        time.sleep(0.7)
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        row = _inbox_conversation_row(context, title, nodes=nodes)
+        if row is not None:
+            return row
+        # The target row can sit anywhere in a long stale inbox — uiautomator
+        # drops invisible children, so neither a clipped row 0 (run-33/run-34:
+        # 'Binh' sat as an invisible child just above the viewport edge) nor a
+        # row ~105 leftover seeded groups deep (run-36 fresh start) is ever in
+        # the dump. Cycle: nudge toward the top once (reveals a clipped row 0 /
+        # fires PTR at rest), then page DOWN one viewport per miss so every
+        # rendered row gets a match attempt; at the sweep limit hard-fling
+        # back to the top for the next cycle. One uiautomator dump per
+        # iteration keeps the sweep fast enough to reach ~106+ rows inside
+        # the deadline. A pull-refresh per miss (~1s cadence) kept the list in
+        # the rid-less churn window (run-32 attempt-1), so refresh only every
+        # 8s — mid-list PTR only nudges ~2 rows back up, net forward.
+        list_node = next((node for node in nodes
+                          if _rid_ends(node, "conversationList")), None)
+        if list_node is not None and list_node.box:
+            cx = (list_node.box[0] + list_node.box[2]) // 2
+            if sweeps == 0:
+                context["device"].swipe(
+                    cx, list_node.box[1] + 60, cx, list_node.box[3] - 40, 300)
+                sweeps = 1
+                time.sleep(0.5)
+            elif sweeps <= _OFFLINE_ROW_SWEEP_LIMIT:
+                context["device"].swipe(
+                    cx, list_node.box[3] - 40, cx, list_node.box[1] + 60, 250)
+                sweeps += 1
+                time.sleep(0.35)
+            else:
+                for _ in range(3):
+                    context["device"].swipe(
+                        cx, list_node.box[1] + 40,
+                        cx, list_node.box[3] - 10, 80)
+                    time.sleep(0.3)
+                sweeps = 0
+        if time.monotonic() - last_pull >= 8:
+            _pull_refresh_inbox(context)
+            last_pull = time.monotonic()
+        time.sleep(0.4)
 
 
-def _offline_open_direct(context: dict[str, Any]) -> None:
-    """Inbox -> the seeded An<->Binh chat through the real row tap."""
+def _offline_open_direct(context: dict[str, Any],
+                         title: str | tuple = "Binh") -> None:
+    """Inbox -> the seeded An<->Binh chat through the real row tap.
+
+    `title` accepts the alias tuple form: post-relaunch the DM row has been
+    observed rendering the just-delivered message text in place of the peer
+    name, so the caller passes the sent probe text alongside 'Binh'."""
+    ui = context["device"]
     row = _offline_wait_inbox_row(
-        context, "Binh", "the seeded Binh row was not on the inbox")
-    context["device"].tap_node(row)
-    _wait_ui_node(context, lambda node: _rid_ends(node, "messageInput"),
-                  "the An-Binh conversation did not open", timeout=30)
+        context, title, "the seeded Binh row was not on the inbox")
+    ui.tap_node(row)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        if any(_rid_ends(node, "messageInput") for node in nodes):
+            return
+        # A tap can land on a row mid-re-layout under the refresh churn, and
+        # a freshly opened chat can pop itself back to the inbox; while the
+        # row list is still the visible surface, re-resolve and tap again
+        # instead of idling the whole budget (run-20 attempt-1).
+        if any(_rid_ends(node, "conversationList") for node in nodes):
+            retry_row = _inbox_conversation_row(context, title)
+            if retry_row is not None:
+                ui.tap_node(retry_row)
+                time.sleep(1.0)
+                continue
+        time.sleep(0.6)
+    raise ProductFailure("the An-Binh conversation did not open")
 
 
 def _offline_inbox_scroll(context: dict[str, Any]) -> None:
-    """One scroll-up gesture inside the conversation list's middle band.
+    """One overlapping scroll-up drag inside the conversation list.
 
-    Swiping from the list's bottom edge lands inside the gesture-nav strip on
-    this 640px screen and the system sends the app home — the walk then scrolls
-    the launcher. Staying between 22% and 76% of the list's height keeps the
-    gesture a real list scroll."""
+    The gesture has to satisfy two constraints on this 320x640 gesture-nav
+    emulator. It must start far enough above the screen's bottom edge that the
+    system does not steal it as a swipe-home (the earlier edge-band swipe
+    repeatedly sent the app to the launcher mid-walk). And it must be short
+    and slow enough that fling momentum cannot skip a whole viewport between
+    a11y dumps — skipped rows never enter the collector's distinct-title set,
+    which is how a fully paged inbox still "surfaced" only a fraction of its
+    rows. ~28% of the list height over 650ms advances roughly two rows per
+    drag, so consecutive viewports always overlap."""
     nodes = _ui_nodes(context)
     container = next((node for node in nodes
                       if _rid_ends(node, "conversationList")), None)
     box = getattr(container, "box", None) or (0, 0, 320, 640)
     cx = (box[0] + box[2]) // 2
     height = box[3] - box[1]
-    context["device"].swipe(cx, box[1] + int(height * 0.76),
-                            cx, box[1] + int(height * 0.22), 350)
+    context["device"].swipe(cx, box[1] + int(height * 0.68),
+                            cx, box[1] + int(height * 0.40), 650)
+
+
+def _offline_ensure_all_filter(context: dict[str, Any]) -> None:
+    """Re-select the 'All' inbox chip when a persisted filter survived.
+
+    InboxViewModel restores selectedFilter from saved state across process
+    death; a leftover 'Unread'/'Groups'/'Archived' selection shrinks the
+    rendered set and the >100-row walk then fails for the wrong reason."""
+    chip = next((node for node in _ui_nodes(context)
+                 if _rid_ends(node, "filterAllChip")), None)
+    if chip is None or not chip.box:
+        return
+    if chip.attrs.get("checked") == "true":
+        return
+    context["device"].tap_node(chip)
+    time.sleep(0.8)
+
+
+def _offline_wait_conv_body(context: dict[str, Any],
+                            reopen_title: str | tuple,
+                            matcher: Callable[[Any], bool], what: str,
+                            timeout: float = 60) -> Any:
+    """Wait for `matcher` to hit a messageBody inside an open conversation.
+
+    The conversation screen can silently pop itself back to the inbox while
+    a fetch settles (run-18 attempts 1+2: the direct view returned to the
+    inbox mid-burst, so messageBody nodes vanished for the rest of the
+    deadline). When the inbox resurfaces, the matching row is tapped again
+    and the wait keeps going instead of burning the budget outside the
+    chat."""
+    ui = context["device"]
+    deadline = time.monotonic() + timeout
+    while True:
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        hit = next((node for node in nodes
+                    if _rid_ends(node, "messageBody") and matcher(node)),
+                   None)
+        if hit is not None:
+            return hit
+        if time.monotonic() >= deadline:
+            raise ProductFailure(what)
+        if any(_rid_ends(node, "conversationList") for node in nodes):
+            row = _inbox_conversation_row(context, reopen_title)
+            if row is not None:
+                ui.tap_node(row)
+                time.sleep(1.2)
+                continue
+        time.sleep(0.7)
+
+
+def _offline_open_action_sheet(context: dict[str, Any], reopen_title: str,
+                               content: str) -> None:
+    """Long-press a rendered bubble, re-entering the chat when it pops away.
+
+    Same silent-pop race as _offline_wait_conv_body: the action-sheet poll
+    can outlive the conversation screen, so when the inbox resurfaces the
+    matching row is tapped again and the long-press retries instead of
+    raising on a bubble that is no longer on screen."""
+    ui = context["device"]
+    deadline = time.monotonic() + _ui_timeout(context)
+    while True:
+        bubble = _message_bubble(context, content)
+        if bubble is None:
+            if time.monotonic() >= deadline:
+                raise ProductFailure(
+                    f"message bubble {content!r} was not on screen")
+            nodes = _ui_nodes(context)
+            if any(_rid_ends(node, "conversationList") for node in nodes):
+                row = _inbox_conversation_row(context, reopen_title)
+                if row is not None:
+                    ui.tap_node(row)
+                    time.sleep(1.2)
+                    continue
+            time.sleep(0.7)
+            continue
+        ui.long_press(bubble)
+        sheet_deadline = time.monotonic() + 6
+        while time.monotonic() < sheet_deadline:
+            if any(_rid_ends(node, "messageActionsTitle")
+                   for node in _ui_nodes(context)):
+                return
+            time.sleep(0.4)
+        if time.monotonic() >= deadline:
+            raise ProductFailure(
+                "the message action sheet did not open after long-press")
 
 
 def _offline_walk_inbox(context: dict[str, Any], title: str,
-                        swipes: int = 60) -> None:
+                        swipes: int = 260) -> None:
     """Scroll the inbox until the oldest seeded group row renders — the pager
-    must have appended every 30-row page above it into Room."""
-    for _ in range(swipes):
-        if _inbox_conversation_row(context, title) is not None:
+    must have appended every 30-row page above it into Room.
+
+    Progress is measured by the smallest sj-os-<tag>-NNN suffix in the
+    viewport (the tail row 001 sorts deepest): the walk is stalled only
+    when that frontier stops descending, never when a post-restart re-walk
+    is still descending through already-paged rows (run-26 attempt-1: one
+    restart at swipe 40 restarted at the top and the flat 80-swipe budget
+    expired around row 052). A visible Retry banner re-issues the killed
+    page fetch without a scroll reset; a frontier stall with no banner
+    escalates to a bounded relaunch that clears the #202 generation lock.
+    """
+    prefix = title.rsplit("-", 1)[0] + "-"
+    suffix_re = re.compile(r"^" + re.escape(prefix) + r"(\d{3})$")
+    restarts = 0
+    retry_taps = 0
+    missing = 0
+    stall = 0
+    frontier: int | None = None
+    for swipe in range(swipes):
+        nodes = _ui_nodes(context)
+        if not any(_rid_ends(node, "conversationList") for node in nodes):
+            missing += 1
+            if missing >= 2:
+                # A coalesced drag-tap can drop the app inside a chat here
+                # too; BACK returns to the inbox for a fraction of a
+                # relaunch (same recovery as the collector's walk).
+                if _offline_app_foreground(context):
+                    context["device"].key("KEYCODE_BACK")
+                    time.sleep(1.0)
+                else:
+                    _offline_relaunch(context)
+                _offline_wait_inbox(
+                    context,
+                    "the inbox did not return during the tail walk",
+                    timeout=45)
+                _offline_ensure_all_filter(context)
+                missing = 0
+                frontier = None  # viewport position changed; re-baseline
+            time.sleep(1.0)
+            continue
+        missing = 0
+        container = next((node for node in nodes
+                          if _rid_ends(node, "conversationList")), None)
+        top, bottom = container.box[1], container.box[3]
+        row = next((node for node in nodes
+                    if ((node.text or "").strip() == title
+                        or (node.desc or "").strip() == title)
+                    and node.box and top <= node.box[1]
+                    and node.box[3] <= bottom), None)
+        if row is not None:
             return
+        current = min((int(match.group(1)) for node in nodes
+                       for match in [suffix_re.match((node.text or "").strip())]
+                       if match), default=None)
+        if current is not None and (frontier is None or current < frontier):
+            frontier = current
+            stall = 0
+        else:
+            stall += 1
+        if stall >= 14:
+            # Same #202 starve the collector escalates on. A Retry banner
+            # means the page fetch died and can be re-issued in place; no
+            # banner at a dead frontier means the generation lock needs a
+            # fresh process (run-24 attempt-2 never left the ~90-row Room
+            # window, run-26 attempt-1 stalled at row ~052).
+            retry = next((node for node in nodes
+                          if node.clickable
+                          and (node.text or "").strip()
+                          in _OFFLINE_RETRY_LABELS), None)
+            if retry is not None and retry_taps < 6:
+                context["device"].tap_node(retry)
+                retry_taps += 1
+                stall = 6
+                time.sleep(1.5)
+                continue
+            if restarts >= 3:
+                break
+            _offline_force_stop(context)
+            _offline_relaunch(context)
+            _offline_wait_inbox(
+                context, "the inbox did not return for the tail walk",
+                timeout=60)
+            _offline_ensure_all_filter(context)
+            restarts += 1
+            stall = 0
+            frontier = None  # re-walk descends from the top: not a stall
+            continue
         _offline_inbox_scroll(context)
         time.sleep(1.0)
     raise ProductFailure(f"the inbox never reached the oldest seeded row {title!r}")
@@ -5903,42 +6388,128 @@ def _offline_pull_until_seed(context: dict[str, Any], prefix: str,
 
     Re-pulling inside the window restarts the generation race, so a second
     pull only happens once after the first half of the deadline passes."""
+    _offline_ensure_all_filter(context)
     _pull_refresh_inbox(context)
     deadline = time.monotonic() + timeout
     repulled = False
     while time.monotonic() < deadline:
         time.sleep(2.5)
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
         if any((node.text or "").strip().startswith(prefix)
-               for node in _ui_nodes(context)):
+               for node in nodes):
             return
         if not repulled and time.monotonic() > deadline - timeout / 2:
             _pull_refresh_inbox(context)
             repulled = True
+    if not _offline_server_reachable(context):
+        _offline_wait_network(
+            context, "the emulator lost connectivity while the seeded "
+                     "inbox first page was fetched", timeout=60)
 
 
 def _offline_collect_inbox_titles(context: dict[str, Any], prefix: str,
-                                  need: int, swipes: int = 70) -> set[str]:
+                                  need: int, swipes: int = 240) -> set[str]:
     """Accumulate distinct inbox row titles matching `prefix` while paging down.
 
     Each viewport renders ~5-7 rows; sweeping the whole seeded block while
     collecting proves >100 conversations paged through the UI even when the
-    exact tail row is hard to name (display order follows lastMessageAt)."""
+    exact tail row is hard to name (display order follows lastMessageAt).
+    When the dump loses the conversationList node entirely the app has been
+    backgrounded — relaunching costs less than swiping the launcher for the
+    rest of the budget."""
+    _offline_ensure_all_filter(context)
     seen: set[str] = set()
     stall = 0
     last = 0
+    missing = 0
+    starve_cycles = 0
+    restarts = 0
     for _ in range(swipes):
-        for node in _ui_nodes(context):
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(1.0)
+            continue
+        container = next((node for node in nodes
+                          if _rid_ends(node, "conversationList")), None)
+        if container is None or not container.box:
+            missing += 1
+            if missing >= 2:
+                # A drag that the system coalesced into a tap opens whichever
+                # conversation sits under the finger (run-19 attempt-1 ended
+                # inside Chi's chat, then cold-restored back into it after
+                # the relaunch). When the app is still foreground one BACK
+                # returns to the inbox for a fraction of a relaunch's cost.
+                if _offline_app_foreground(context):
+                    context["device"].key("KEYCODE_BACK")
+                    time.sleep(1.0)
+                else:
+                    _offline_relaunch(context)
+                try:
+                    _offline_wait_inbox(
+                        context,
+                        "the inbox did not return during the seeded walk",
+                        timeout=45)
+                except Exception:
+                    _offline_relaunch(context)
+                    _offline_wait_inbox(
+                        context,
+                        "the inbox did not return during the seeded walk")
+                _offline_ensure_all_filter(context)
+                missing = 0
+            time.sleep(1.0)
+            continue
+        missing = 0
+        for node in nodes:
             text = (node.text or "").strip()
             if text.startswith(prefix):
                 seen.add(text)
         if len(seen) >= need:
             return seen
         stall = stall + 1 if len(seen) == last else 0
+        if len(seen) != last:
+            starve_cycles = 0
         last = len(seen)
         if stall >= 15:
-            # Long quiet stall: the page-1 write may have been superseded
-            # before landing — one extra refresh is the last resort.
-            _pull_refresh_inbox(context)
+            # Long quiet stall: if the radio died mid-walk no pull will land
+            # anything; probe before wasting another refresh cycle.
+            if not _offline_server_reachable(context):
+                _offline_wait_network(
+                    context, "the emulator lost connectivity during the "
+                             "seeded inbox walk", timeout=60)
+            # The page-1 write may have been superseded before landing (#202
+            # generation race), which also leaves hasMoreInboxPages=false so
+            # no further page can ever be requested. When the network banner
+            # is up its Retry button re-issues the fetch without dragging the
+            # list back to the top; a pull-drag mid-walk would scroll several
+            # rows upward and waste traversal on every stall cycle.
+            retry = next((node for node in nodes
+                          if node.clickable
+                          and (node.text or "").strip()
+                          in _OFFLINE_RETRY_LABELS), None)
+            if retry is not None:
+                context["device"].tap_node(retry)
+                starve_cycles += 1
+            elif starve_cycles >= 3 and restarts < 2:
+                # A sustained starve means the supersede race keeps killing
+                # every page fetch; only a fresh process clears the
+                # generation lock so the next page-1 lands current. Room
+                # rows persist, so `seen` survives — this is a user reopening
+                # the app, not a data poke (run-24 attempt-2 starved ~90).
+                _offline_force_stop(context)
+                _offline_relaunch(context)
+                _offline_wait_inbox(
+                    context,
+                    "the inbox did not return for the walk restart",
+                    timeout=60)
+                _offline_ensure_all_filter(context)
+                restarts += 1
+                starve_cycles = 0
+            else:
+                _pull_refresh_inbox(context)
+                starve_cycles += 1
             stall = 0
             time.sleep(1.5)
             continue
@@ -5951,38 +6522,143 @@ def _offline_restore_an(context: dict[str, Any]) -> None:
     """Leave the device signed in as seed An through the real UI.
 
     A failure mid A->B->A switch would otherwise strand the emulator on the
-    login form or inside Binh's session and poison every following row."""
+    login form or inside Binh's session and poison every following row. The
+    shared ensure_device_account probe fails the row outright on either of
+    those states, so this restore resolves them itself: a visible login form
+    gets An's credentials through the journey's own sign-in path, and a live
+    session is checked on the profile screen, signed out when it is not An,
+    then signed back in as An."""
     api, _adb_ui, patch = context["helpers"]
     ui = context["device"]
-    patch.ensure_device_account(
-        ui, Path(context["row_dir"]), fresh_login=False)
-    profile = _wait_ui_node(
-        context, lambda node: _rid_ends(node, "inboxUserAvatar"),
-        "the inbox profile entry point was not visible during restore",
-        timeout=30)
-    ui.tap_node(profile)
-    name = _wait_ui_node(
-        context, lambda node: _rid_ends(node, "profileName"),
-        "the profile name did not render during restore", timeout=20)
-    if name.text.strip() == "An":
-        ui.key("KEYCODE_BACK")
-        _offline_wait_inbox(context, "the inbox did not return after restore")
-        return
-    ui.key("KEYCODE_BACK")
-    _offline_wait_inbox(context, "the wrong-account inbox did not return")
-    _offline_sign_out(context)
-    _offline_sign_in(context, api.USER_A["phone"], "An")
+    deadline = time.monotonic() + 90
+    launcher_relaunches = 0
+    while True:
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        if patch.login_form_visible(nodes):
+            _offline_sign_in(context, api.USER_A["phone"], "An")
+            return
+        avatar = next((node for node in nodes
+                       if _rid_ends(node, "inboxUserAvatar")), None)
+        if avatar is not None:
+            ui.tap_node(avatar)
+            name = _wait_ui_node(
+                context, lambda node: _rid_ends(node, "profileName"),
+                "the profile name did not render during restore", timeout=20)
+            name_is_an = name.text.strip() == "An"
+            ui.key("KEYCODE_BACK")
+            # A restored task can keep the profile surface as its root, so
+            # BACK may exit to the launcher instead of the inbox (run-19
+            # attempt-2). Poll briefly, relaunch while the app is gone, and
+            # fall back to the outer loop's recovery rather than failing on
+            # a dead back stack.
+            inbox_back = False
+            inbox_deadline = time.monotonic() + 15
+            while time.monotonic() < inbox_deadline:
+                probe = _ui_nodes(context)
+                if _dismiss_occluder(context, probe):
+                    time.sleep(0.8)
+                    continue
+                if any(_rid_ends(node, "inboxUserAvatar") for node in probe):
+                    inbox_back = True
+                    break
+                if not _offline_app_foreground(context):
+                    _offline_relaunch(context)
+                time.sleep(0.8)
+            if not inbox_back:
+                continue
+            if name_is_an:
+                return
+            _offline_sign_out(context)
+            _offline_sign_in(context, api.USER_A["phone"], "An")
+            return
+        if time.monotonic() >= deadline:
+            raise EnvironmentFailure(
+                "neither the login form nor the inbox rendered while "
+                "restoring the device account")
+        if _offline_app_foreground(context):
+            # Some in-app surface (splash, chat, profile): Back pops one
+            # fragment toward the inbox or the login form.
+            ui.key("KEYCODE_BACK")
+        else:
+            # On the launcher a stray Back already sent the app home; only a
+            # fresh am start brings the task forward again (run-11 attempt-1).
+            # A dead task can still resume a mid-app surface as its root —
+            # after one plain relaunch that changed nothing, force-stop so
+            # the next start rebuilds the stack from the start destination
+            # (run-19 attempt-2 restored into a profile-root task).
+            if launcher_relaunches >= 1:
+                _offline_force_stop(context)
+            _offline_relaunch(context)
+            launcher_relaunches += 1
+        time.sleep(1.5)
 
 
-def _offline_sync_requests(context: dict[str, Any]) -> tuple[int, list[int]]:
-    """(count, body sizes) of POST /api/v1/sync lines in the logcat buffer."""
-    raw = context["adb"].command("logcat", "-d", "-v", "brief", timeout=40,
-                               check=False)
+def _offline_prepare_an(context: dict[str, Any]) -> None:
+    """_prepare_seeded_an, except restore-before-assert instead of assert-first.
+
+    The shared prep verifies the visible account and fails when a prior run
+    stranded the emulator signed out or on a non-An session; this row repairs
+    that state through the real UI before its first assertion runs. The GMS
+    autofill service is also parked for the row's lifetime (and restored in
+    the finally): it intermittently overwrites the login phone field with a
+    saved credential between our fill and the Sign-in tap."""
+    adb = context["adb"]
+    adb.command("shell", "cmd", "statusbar", "collapse",
+                timeout=20, check=False)
+    context["offline_autofill_before"] = adb.command(
+        "shell", "settings", "get", "secure", "autofill_service",
+        timeout=15, check=False)
+    adb.command("shell", "settings", "put", "secure", "autofill_service",
+                "null", timeout=15, check=False)
+    if context.get("reset_app_data"):
+        _clear_app_data(context)
+    _offline_restore_an(context)
+
+
+_OFFLINE_LOGCAT_TS_RE = re.compile(r"^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})")
+
+
+def _offline_logcat_clock(context: dict[str, Any]) -> str:
+    """Device-side 'MM-DD HH:MM:SS.000' watermark for a sync window.
+
+    `adb shell` re-parses arguments on-device, so the format must not
+    contain a literal space; `date +%m-%dT%H:%M:%S` ships as a single
+    argument and the T is swapped back for the logcat threadtime grammar
+    (run-28 attempt-1 died on `date: Max 1 argument`)."""
+    stamp = context["adb"].command(
+        "shell", "date", "+%m-%dT%H:%M:%S", timeout=15).strip()
+    return f"{stamp.replace('T', ' ')}.000"
+
+
+def _offline_sync_requests(context: dict[str, Any],
+                           since: str | None = None) -> tuple[int, list[int]]:
+    """(count, body sizes) of POST /api/v1/sync lines in the logcat buffer.
+
+    `since` keeps only lines whose threadtime stamp is at or after a
+    device-side watermark, filtered here in Python rather than through
+    `logcat -t`: a malformed -t argument makes logcat exit non-zero with
+    an empty stdout, which is indistinguishable from "no sync traffic"
+    (run-29 attempt-1 polled 0 while ~70 real POSTs sat in the window).
+    The unscoped whole-buffer count is only a point-in-time size anyway:
+    this run's >40-minute walk rotates the ring buffer hard enough that
+    baseline sync lines evict before the second read (run-27 attempt-1).
+    """
+    raw = context["adb"].command("logcat", "-d", "-v", "threadtime",
+                               timeout=40, check=False)
     posts = 0
     bodies: list[int] = []
     for line in raw.splitlines():
         if not _OFFLINE_SYNC_POST_RE.search(line):
             continue
+        if since:
+            stamp = _OFFLINE_LOGCAT_TS_RE.match(line)
+            # Only a proven-older line is excluded; a line without a
+            # parseable stamp stays in (harness fakes log raw OkHttp).
+            if stamp is not None and stamp.group(1) < since:
+                continue
         posts += 1
         match = _OFFLINE_SYNC_BYTES_RE.search(line)
         if match:
@@ -6011,7 +6687,11 @@ def _offline_sign_out(context: dict[str, Any]) -> None:
     ui.tap_node(confirm)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if patch.login_form_visible(_ui_nodes(context)):
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        if patch.login_form_visible(nodes):
             return
         time.sleep(0.7)
     raise EnvironmentFailure("the login form did not appear after Sign out")
@@ -6029,20 +6709,43 @@ def _offline_sign_in(context: dict[str, Any], phone: str,
     ui = context["device"]
     deadline = time.monotonic() + 45
     while True:
-        if patch.login_form_visible(_ui_nodes(context)):
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        if patch.login_form_visible(nodes):
             break
         if time.monotonic() >= deadline:
             raise EnvironmentFailure(
                 f"the login form never appeared for {display_name}")
         time.sleep(0.7)
-    patch.fill_login_field(ui, "phoneInput", phone)
-    ui.key("KEYCODE_BACK")
-    patch.fill_login_field(
-        ui, "passwordInput",
-        password if password is not None else getattr(patch, "PASSWORD", "password123"))
-    context["adb"].command("shell", "input", "keyevent", "4",
-                           timeout=15, check=False)
-    time.sleep(1)
+    # The emulator's GMS autofill intermittently overwrites the phone field
+    # with a saved credential between our fill and the Sign-in tap (run-9
+    # attempt-1), and the first tap right after the form draws can miss input
+    # focus while the IME settles (run-11 attempt-2). Refill-and-verify a
+    # bounded number of times before giving up.
+    resolved_password = (password if password is not None
+                         else getattr(patch, "PASSWORD", "password123"))
+    for _attempt in range(3):
+        try:
+            patch.fill_login_field(ui, "phoneInput", phone)
+            ui.key("KEYCODE_BACK")
+            patch.fill_login_field(ui, "passwordInput", resolved_password)
+        except Exception:
+            if _attempt == 2:
+                raise
+            time.sleep(1.5)
+            continue
+        context["adb"].command("shell", "input", "keyevent", "4",
+                               timeout=15, check=False)
+        time.sleep(1)
+        nodes = _ui_nodes(context)
+        phone_field = patch.node_by_id(nodes, "phoneInput")
+        if phone_field is not None and phone_field.text.strip() == phone:
+            break
+    else:
+        raise EnvironmentFailure(
+            f"the login phone field would not hold {phone!r}")
     nodes = _ui_nodes(context)
     action = patch.node_by_id(nodes, "primaryAction") or next(
         (node for node in nodes
@@ -6050,8 +6753,35 @@ def _offline_sign_in(context: dict[str, Any], phone: str,
     if action is None:
         raise EnvironmentFailure("the sign-in control was not exposed")
     ui.tap_node(action)
-    _offline_wait_inbox(context, f"{display_name} did not reach the inbox",
-                        timeout=90)
+    # A fresh sign-in has to REST-sync the whole inbox before the avatar rid
+    # exists; on a loaded fixture (~106 conversations over an encrypted Room
+    # cold open) that first sync has outrun the 90s budget (run-47 attempt-2
+    # cleanup restore died here while the inbox rendered seconds later).
+    # Poll inline instead of _offline_wait_inbox: if the submit tap missed or
+    # the auth call failed, the app sits on the login form for the whole
+    # budget while the row finally-restore later signs in fine and the
+    # capture misleadingly shows a rendered inbox (run-48/run-49 attempt-2).
+    inbox_deadline = time.monotonic() + 180
+    retap_deadline = time.monotonic() + 20
+    while True:
+        nodes = _ui_nodes(context)
+        if _dismiss_occluder(context, nodes):
+            time.sleep(0.8)
+            continue
+        if any(_rid_ends(node, "inboxUserAvatar")
+               or _rid_ends(node, "conversationList") for node in nodes):
+            break
+        if time.monotonic() >= inbox_deadline:
+            raise ProductFailure(f"{display_name} did not reach the inbox")
+        if time.monotonic() >= retap_deadline:
+            retry = patch.node_by_id(nodes, "primaryAction") or next(
+                (node for node in nodes
+                 if patch.text_matches(node, ("Sign in", "Đăng nhập"))), None)
+            if retry is not None and patch.login_form_visible(nodes):
+                ui.tap_node(retry)
+                time.sleep(1.5)
+            retap_deadline = time.monotonic() + 20
+        time.sleep(0.7)
     avatar = _wait_ui_node(
         context, lambda node: _rid_ends(node, "inboxUserAvatar"),
         "the profile entry point was not visible after sign-in")
@@ -6063,6 +6793,62 @@ def _offline_sign_in(context: dict[str, Any], phone: str,
         f"the signed-in profile did not identify {display_name}", timeout=15)
     ui.key("KEYCODE_BACK")
     _offline_wait_inbox(context, "the inbox did not return after the profile check")
+
+
+def _offline_purge_stale_groups(recorder: RecordingClient,
+                                token: Callable[[], str],
+                                self_user_id: str) -> int:
+    """Leave every leftover ``sj-os-*`` group still in An's inbox.
+
+    A run that dies before its member/leave sweep orphans ~106 seeded groups;
+    they accumulate in the inbox (run-49 attempt-2: 106 orphans from attempt-1
+    alone), stretch the post-restore first sync past the sign-in budget — the
+    failure capture showed a fully rendered inbox seconds after the 180s
+    deadline — and bury seeded rows other journeys scan for. Best-effort: a
+    purge miss never blocks the journey; the per-run sweep still releases
+    what it can at teardown."""
+    try:
+        response = recorder.get("/api/v1/conversations", token=token())
+    except Exception:
+        return 0
+    if response.status != 200:
+        return 0
+    body = response.json() or []
+    items = body.get("items") if isinstance(body, dict) else body
+    purged = 0
+    for item in items or []:
+        if item.get("type") != "GROUP":
+            continue
+        if not str(item.get("title") or "").startswith("sj-os-"):
+            continue
+        conv_id = str(item.get("id") or "")
+        if not conv_id:
+            continue
+        try:
+            for member in item.get("members") or []:
+                member_id = str(member.get("userId") if isinstance(member, dict)
+                                else member or "")
+                if member_id and member_id != self_user_id:
+                    _remove_member_rest(recorder, token(), conv_id, member_id)
+            left = recorder.post(
+                f"/api/v1/conversations/{conv_id}/leave", token=token())
+            for _attempt in range(2):
+                if left.status != 429:
+                    break
+                details = ((left.json() or {}).get("error") or {}) \
+                    .get("details") or {}
+                try:
+                    retry_after = int(details.get("retryAfterSeconds") or 5)
+                except (TypeError, ValueError):
+                    retry_after = 5
+                time.sleep(min(30, max(2, retry_after + 1)))
+                left = recorder.post(
+                    f"/api/v1/conversations/{conv_id}/leave", token=token())
+            if left.status in (200, 204):
+                purged += 1
+        except Exception:
+            continue
+    return purged
 
 
 def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]:
@@ -6088,23 +6874,39 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
     """
     _campaign_serial(context)
     _campaign_base_url(context)
-    _prepare_seeded_an(context)
+    _offline_prepare_an(context)
     api, _adb_ui, patch = context["helpers"]
     recorder: RecordingClient = context["client"]
     ui = context["device"]
     an = _actor_session(api, recorder, api.USER_A["phone"])
     binh = _actor_session(api, recorder, api.USER_C["phone"])
     chi = _actor_session(api, recorder, api.USER_B["phone"])
-    an_token = an["accessToken"]
-    binh_token = binh["accessToken"]
     an_id = str((an.get("user") or {}).get("id") or "")
     binh_id = str((binh.get("user") or {}).get("id") or "")
     chi_id = str((chi.get("user") or {}).get("id") or "")
     if not an_id or not binh_id or not chi_id:
         raise EnvironmentFailure("seed actor sessions did not expose user ids")
+    _TOK_PHONES = {"an": api.USER_A["phone"], "binh": api.USER_C["phone"],
+                   "chi": api.USER_B["phone"]}
+
+    def _tok(label: str) -> str:
+        """Resolve a live access token at call time.
+
+        The journey runs longer than the ~15-minute token TTL, so fixtures
+        never hold a token string — _actor_session revalidates through the
+        temp-file session cache and re-logins once it goes stale (run-25
+        attempt-1 expired mid-walk)."""
+        return str(_actor_session(api, recorder, _TOK_PHONES[label])
+                   ["accessToken"])
+
+    _ta = lambda: _tok("an")
+    _tb = lambda: _tok("binh")
+    purged = _offline_purge_stale_groups(recorder, _ta, an_id)
+    if purged:
+        print(f"[offline-sync] purged {purged} leftover sj-os-* groups")
     try:
         _, conversation = api.direct_conversation(
-            recorder, an_token, api.USER_C["phone"])
+            recorder, _ta(), api.USER_C["phone"])
     except Exception as error:
         raise EnvironmentFailure(
             "the seeded An-Binh conversation could not be opened") from error
@@ -6143,33 +6945,45 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
         # Interleaving authors keeps each 30/10s write bucket honest and leaves
         # one edited and one recalled message inside the rendered tail after
         # the restart (tail order follows original seq, not the edit time).
-        _offline_open_direct(context)
+        # Bump the seeded DM toward inbox row 0 before opening it — on a stale
+        # inbox the row sits >100 leftover conversations deep (run-36/37) and
+        # even the page-down sweep may not reach it inside one cycle. The
+        # delta/pull-refresh that lands this text is itself under test, and
+        # the row can render the message text as its title post-bump.
+        bump_text = f"sj-osb-{tag}"
+        bump_msg = _offline_send_rest(
+            recorder, _tb, conversation_id, bump_text)
+        created.append((conversation_id, str(bump_msg.get("id")), api.USER_C["phone"]))
+        _offline_open_direct(context, title=("Binh", bump_text))
         for index in range(_OFFLINE_FIXTURE_EACH):
             e_msg = _offline_send_rest(
-                recorder, binh_token, conversation_id, edit_src[index])
+                recorder, _tb, conversation_id, edit_src[index])
             created.append((conversation_id, str(e_msg.get("id")), api.USER_C["phone"]))
             edit_ids.append(str(e_msg.get("id")))
             time.sleep(_OFFLINE_SEND_GAP_S / 2)
             r_msg = _offline_send_rest(
-                recorder, an_token, conversation_id, recall_src[index])
+                recorder, _ta, conversation_id, recall_src[index])
             created.append((conversation_id, str(r_msg.get("id")), api.USER_A["phone"]))
             recall_ids.append(str(r_msg.get("id")))
             time.sleep(_OFFLINE_SEND_GAP_S / 2)
         target_msg = _offline_send_rest(
-            recorder, binh_token, conversation_id, react_target)
+            recorder, _tb, conversation_id, react_target)
         created.append((conversation_id, str(target_msg.get("id")), api.USER_C["phone"]))
-        _wait_ui_node(
-            context,
-            lambda node: _rid_ends(node, "messageBody")
-                         and node.text.strip() == react_target,
+        # The 61-frame burst lands over ~42s while the app applies each frame
+        # serially (Room write + coalesced inbox refresh + chat re-render); the
+        # tail sits behind that backlog, so a 60s wall clock expired mid-drain
+        # (run-35/-38 attempt-1) even though the same phase passed on retry.
+        _offline_wait_conv_body(
+            context, "Binh",
+            lambda node: node.text.strip() == react_target,
             "the seeded fixture burst did not reach the open conversation",
-            timeout=40)
+            timeout=120)
 
         # --- Phase O: queue two texts + one reaction while offline ----------
         _offline_patch(context, "cut_network")
         for content in ot_texts:
             _offline_patch(context, "queue_offline_text", ui, content)
-        _open_action_sheet(context, react_target)
+        _offline_open_action_sheet(context, "Binh", react_target)
         tile = _wait_ui_node(
             context,
             lambda node: (node.desc or "").strip() in _CHAT_REACTION_TILE,
@@ -6186,23 +7000,26 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
         # Queued work survives process death: cold-relaunch while still cut.
         _offline_force_stop(context)
         _offline_relaunch(context)
-        _offline_wait_inbox(context,
-                            "the inbox did not return after the offline restart")
+        _offline_wait_inbox(
+            context, "the inbox did not return after the offline restart",
+            timeout=60)
         _offline_open_direct(context)
         for content in ot_texts:
-            _wait_ui_node(
-                context,
-                lambda node, c=content: _rid_ends(node, "messageBody")
-                                        and c in node.text,
+            _offline_wait_conv_body(
+                context, "Binh",
+                lambda node, c=content: c in (node.text or ""),
                 f"queued message {content!r} did not survive the offline restart")
         ui.screenshot(str(row_dir / "offline-after-restart.png"))
 
         # --- Phase R1: reconnect flush, exactly once per clientMessageId -----
         _offline_patch(context, "restore_test_network", before)
+        _offline_wait_network(
+            context,
+            "the device never regained connectivity after the offline phase")
         flushed: list[dict[str, Any]] = []
         deadline = time.monotonic() + 45
         while True:
-            items = _history_items(recorder, binh_token, conversation_id)
+            items = _offline_history(recorder, _tb, conversation_id)
             flushed = [item for item in items
                        if item.get("content") in set(ot_texts)]
             if len(flushed) >= 2:
@@ -6244,7 +7061,7 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
             else:
                 db_note = f"server-db matched {len(matched)}/{len(ot_texts)} texts"
         _history_wait(
-            recorder, binh_token, conversation_id,
+            recorder, _tb(), conversation_id,
             lambda item: item.get("content") == react_target and any(
                 entry.get("emoji") == _CHAT_REACTION_EMOJI
                 and int(entry.get("count") or 0) >= 1
@@ -6259,7 +7076,7 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
             title = f"sj-os-{tag}-{index:03d}"
             created_group = _offline_rest_once(
                 lambda t=title: recorder.post(
-                    "/api/v1/conversations/group", token=an_token,
+                    "/api/v1/conversations/group", token=_ta(),
                     body={"title": t, "memberIds": [binh_id]}),
                 {200, 201}, f"seeded group {title}")
             cid = str((created_group.json() or {}).get("id") or "")
@@ -6269,7 +7086,7 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
             group_members.append((cid, binh_id))
         created_group = _offline_rest_once(
             lambda: recorder.post(
-                "/api/v1/conversations/group", token=an_token,
+                "/api/v1/conversations/group", token=_ta(),
                 body={"title": aonly_title, "memberIds": [chi_id]}),
             {200, 201}, "the An/Chi-only group")
         aonly_id = str((created_group.json() or {}).get("id") or "")
@@ -6281,6 +7098,15 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
         # lastMessageSeq=1 and ranks by createdAt DESC under the messaged
         # direct chat — the last-created group is the page-1 probe for Binh.
         top_title = f"sj-os-{tag}-{_OFFLINE_GROUP_COUNT:03d}"
+        # Watermark window opens here, not at the R3 force-stop: whether a
+        # reconnect relaunch POSTs its watermarks at all is racy in product
+        # (SyncEngine silently completes when the session epoch moved or the
+        # cursor row is not loaded yet, and STOMP can deliver the pending
+        # deltas first — run-29's relaunch stormed 57 posts while run-30's
+        # issued zero). Every post-seed relaunch — the walk's starve
+        # restarts included — fans the same >100-watermark set into the
+        # same bounded batches, so the window spans them all.
+        sync_since = _offline_logcat_clock(context)
         _offline_wait_sync_quiet(context)
         _offline_pull_until_seed(context, f"sj-os-{tag}-")
         seen = _offline_collect_inbox_titles(
@@ -6298,28 +7124,27 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
                 f"conversation rows; the >{_OFFLINE_SEEN_MIN}-conversation set "
                 "must all render from Room")
         marker_conv_id = _offline_chunk_tail(
-            recorder, an_token, set(seeded.values()))
+            recorder, _ta, set(seeded.values()))
         marker_title = next(title for title, cid in seeded.items()
                             if cid == marker_conv_id)
 
         # --- Phase R3: restart, 60 reconciled deltas, second-batch marker ----
-        posts_before, bodies_before = _offline_sync_requests(context)
         _offline_force_stop(context)
         for index, message_id in enumerate(edit_ids):
             _offline_rest_once(
                 lambda mid=message_id, i=index: recorder.patch(
                     f"/api/v1/conversations/{conversation_id}/messages/{mid}",
-                    token=binh_token,
+                    token=_tb(),
                     body={"content": edited_to[edit_src[i]]}),
                 {200}, f"peer edit {index + 1}")
         for index, message_id in enumerate(recall_ids):
             _offline_rest_once(
                 lambda mid=message_id: recorder.delete(
                     f"/api/v1/conversations/{conversation_id}/messages/{mid}",
-                    token=an_token),
+                    token=_ta()),
                 {200, 204}, f"fixture recall {index + 1}")
         marker_msg = _offline_send_rest(
-            recorder, binh_token, marker_conv_id, marker_text)
+            recorder, _tb, marker_conv_id, marker_text)
         created.append((marker_conv_id, str(marker_msg.get("id")), api.USER_C["phone"]))
         _offline_relaunch(context)
         _offline_wait_inbox(context,
@@ -6330,20 +7155,33 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
         ui.tap_node(marker_row)
         _wait_ui_node(context, lambda node: _rid_ends(node, "messageInput"),
                       "the marker conversation did not open", timeout=30)
-        _wait_ui_node(
-            context,
-            lambda node: _rid_ends(node, "messageBody")
-                         and marker_text in node.text,
+        _offline_wait_conv_body(
+            context, marker_title,
+            lambda node: marker_text in (node.text or ""),
             "the marker message was not rendered in the second-batch conversation")
         ui.screenshot(str(row_dir / "chunk2-marker.png"))
-        posts_after, bodies_after = _offline_sync_requests(context)
-        new_posts = posts_after - posts_before
+        # The marker row renders from Room/STOMP ahead of the watermark
+        # fan-out: the relaunch's POST /api/v1/sync batches land seconds to
+        # minutes after the marker (run-27 attempt-1 read the buffer ~2.5
+        # minutes early and counted 0 while the real batches were still
+        # draining). Poll until the bounded batches show, then assert —
+        # still-absent sync traffic after the window is a real product gap.
+        sync_deadline = time.monotonic() + _OFFLINE_SYNC_POLL_S
+        new_posts, new_bodies = 0, []
+        while True:
+            new_posts, new_bodies = _offline_sync_requests(context, sync_since)
+            if (new_posts >= 2
+                    and any(body > _OFFLINE_FULL_BATCH_BYTES
+                            for body in new_bodies)):
+                break
+            if time.monotonic() >= sync_deadline:
+                break
+            time.sleep(5)
         if new_posts < 2:
             raise ProductFailure(
                 f"the reconnect sync issued {new_posts} POST /api/v1/sync "
                 "requests; the >100-watermark set must fan into at least two "
                 "bounded batches")
-        new_bodies = bodies_after[len(bodies_before):]
         if new_bodies and len(new_bodies) == new_posts \
                 and max(new_bodies) <= _OFFLINE_FULL_BATCH_BYTES:
             raise ProductFailure(
@@ -6356,22 +7194,23 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
         # post-restart new-message delta landed.
         probe_text = f"sj-osp-{tag}"
         probe_msg = _offline_send_rest(
-            recorder, binh_token, conversation_id, probe_text)
+            recorder, _tb, conversation_id, probe_text)
         created.append((conversation_id, str(probe_msg.get("id")),
                         api.USER_C["phone"]))
-        _offline_open_direct(context)
-        _wait_ui_node(
-            context,
-            lambda node: _rid_ends(node, "messageBody")
-                         and probe_text in node.text,
+        # Post-relaunch the DM row has rendered the fresh last-message text
+        # as its title instead of the peer name (run-31 attempt-1); either
+        # string identifies the same unambiguous row.
+        _offline_open_direct(context, title=("Binh", probe_text))
+        _offline_wait_conv_body(
+            context, "Binh",
+            lambda node: probe_text in (node.text or ""),
             "the post-restart peer text did not render in the direct chat",
-            timeout=40)
+            timeout=60)
         last_edit = edited_to[edit_src[-1]]
-        _wait_ui_node(
-            context,
-            lambda node: _rid_ends(node, "messageBody")
-                         and node.text.strip() == last_edit,
-            "the reconciled tail edit was not rendered", timeout=40)
+        _offline_wait_conv_body(
+            context, ("Binh", probe_text, last_edit),
+            lambda node: node.text.strip() == last_edit,
+            "the reconciled tail edit was not rendered", timeout=60)
         _wait_ui_node(
             context,
             lambda node: node.text.strip() in _CHAT_EDITED_MARKERS,
@@ -6381,7 +7220,7 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
             lambda node: node.text.strip() in _CHAT_TOMBSTONE_MARKERS,
             "no recalled tombstone rendered after the reconcile")
         ui.screenshot(str(row_dir / "post-restart-tail.png"))
-        history = _offline_history(recorder, binh_token, conversation_id)
+        history = _offline_history(recorder, _tb, conversation_id)
         edited_rows = [item for item in history
                        if item.get("content") in set(edited_to.values())]
         if len(edited_rows) != _OFFLINE_FIXTURE_EACH or not all(
@@ -6404,21 +7243,26 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
             context, top_title,
             "Binh's session did not converge the shared seeded groups",
             timeout=60)
-        if aonly_id in _offline_inbox_ids(recorder, binh_token):
+        if aonly_id in _offline_inbox_ids(recorder, _tb):
             raise ProductFailure(
                 "the An/Chi-only fixture leaked into Binh's inbox")
         ui.screenshot(str(row_dir / "switch-b-inbox.png"))
         _offline_sign_out(context)
         _offline_sign_in(context, api.USER_A["phone"], "An")
         final_msg = _offline_send_rest(
-            recorder, binh_token, conversation_id, final_text)
+            recorder, _tb, conversation_id, final_text)
         created.append((conversation_id, str(final_msg.get("id")), api.USER_C["phone"]))
-        _offline_open_direct(context)
-        _wait_ui_node(
-            context,
-            lambda node: _rid_ends(node, "messageBody")
-                         and node.text.strip() == final_text,
-            "a fresh peer message did not land after the ABA switch", timeout=40)
+        _offline_open_direct(context, title=("Binh", final_text))
+        # A fresh sign-in's STOMP/delta pipeline lags well behind the inbox
+        # REST sync: the ABA message already bumped the Binh row's timestamp
+        # before the conversation surface had the body (run-51 attempt-1 timed
+        # out at 60s while the row itself had just updated). Give the
+        # conversation-level land a wider window than the warm-session waits.
+        _offline_wait_conv_body(
+            context, ("Binh", final_text),
+            lambda node: node.text.strip() == final_text,
+            "a fresh peer message did not land after the ABA switch",
+            timeout=150)
         ui.screenshot(str(row_dir / "switch-aba-inbox.png"))
         ui.key("KEYCODE_BACK")
         _offline_wait_inbox(context, "the inbox did not return at row end")
@@ -6445,6 +7289,15 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
             _offline_patch(context, "restore_device_settings", before)
         except Exception as error:
             cleanup_errors.append(f"settings restore: {type(error).__name__}")
+        autofill_before = context.pop("offline_autofill_before", None)
+        if autofill_before and autofill_before != "null":
+            try:
+                context["adb"].command(
+                    "shell", "settings", "put", "secure", "autofill_service",
+                    autofill_before, timeout=15, check=False)
+            except Exception as error:
+                cleanup_errors.append(
+                    f"autofill restore: {type(error).__name__}")
         # Row phases outlive the JWT lifetime, so fixture sweep re-auths
         # through the cached/validated login helper instead of the start-of-row
         # tokens (first live run: every delete returned 401).
@@ -6461,24 +7314,58 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
                 continue
         for conv_id, message_id, author_phone in created:
             token = sweep_tokens.get(author_phone) or (
-                an_token if author_phone == api.USER_A["phone"] else binh_token)
+                _ta() if author_phone == api.USER_A["phone"] else _tb())
             try:
-                deleted = recorder.delete(
-                    f"/api/v1/conversations/{conv_id}/messages/{message_id}",
-                    token=token)
-                if deleted.status not in (200, 204, 404):
+                deleted = None
+                # The >60-delete burst outruns the per-minute write bucket;
+                # run-31 attempt-2 passed every product assertion then lost
+                # its PASS to six 429s here. Retry honoring retryAfterSeconds
+                # so an exhausted bucket is a delay, not a cleanup miss.
+                for _attempt in range(3):
+                    deleted = recorder.delete(
+                        f"/api/v1/conversations/{conv_id}/messages/"
+                        f"{message_id}", token=token)
+                    if deleted.status != 429:
+                        break
+                    details = ((deleted.json() or {}).get("error") or {}) \
+                        .get("details") or {}
+                    try:
+                        retry_after = int(
+                            details.get("retryAfterSeconds") or 5)
+                    except (TypeError, ValueError):
+                        retry_after = 5
+                    time.sleep(min(30, max(2, retry_after + 1)))
+                if deleted is not None and deleted.status not in (200, 204, 404):
                     cleanup_errors.append(f"message delete HTTP {deleted.status}")
             except Exception as error:
                 cleanup_errors.append(f"message sweep: {type(error).__name__}")
-        sweep_an = sweep_tokens.get(api.USER_A["phone"], an_token)
+            time.sleep(0.25)
+        sweep_an = sweep_tokens.get(api.USER_A["phone"], _ta())
+
+        def _cleanup_call(make_call: Callable[[], Any]) -> Any:
+            """Bounded 429 drain shared by the member/leave sweep below."""
+            response = make_call()
+            for _attempt in range(2):
+                if response.status != 429:
+                    break
+                details = ((response.json() or {}).get("error") or {}) \
+                    .get("details") or {}
+                try:
+                    retry_after = int(details.get("retryAfterSeconds") or 5)
+                except (TypeError, ValueError):
+                    retry_after = 5
+                time.sleep(min(30, max(2, retry_after + 1)))
+                response = make_call()
+            return response
+
         for conv_id, member_id in group_members:
             try:
                 _remove_member_rest(recorder, sweep_an, conv_id, member_id)
             except Exception as error:
                 cleanup_errors.append(f"member sweep: {type(error).__name__}")
             try:
-                left = recorder.post(
-                    f"/api/v1/conversations/{conv_id}/leave", token=sweep_an)
+                left = _cleanup_call(lambda: recorder.post(
+                    f"/api/v1/conversations/{conv_id}/leave", token=sweep_an))
                 if left.status not in (200, 204, 400, 403, 404):
                     cleanup_errors.append(f"leave HTTP {left.status}")
             except Exception as error:
@@ -6724,6 +7611,11 @@ def run_calls_injected_notification(row: JourneyRow, context: dict[str, Any]) ->
     _campaign_base_url(context)
     adb = context["adb"]
     _prepare_seeded_an(context)
+    # Runtime grants are a precondition of the dead-process assertion: without
+    # POST_NOTIFICATIONS the incoming-call surface cannot legally appear
+    # (notification suppressed, activity fallback BAL-blocked). The grant is
+    # idempotent, so applying it unconditionally mirrors _clear_app_data.
+    context["helpers"][2].grant_test_permissions()
     an, _binh, conversation_id, recipient_id, caller_id = _seed_pair(context)
     call_id = "sj-call-" + uuid.uuid4().hex[:8]
     cleanup_errors: list[str] = []
@@ -8310,12 +9202,17 @@ def _status_for_error(error: Exception) -> str:
 
 
 def _uiautomator_pids(ps_output: str) -> list[str]:
-    """PIDs of `uiautomator` shell processes listed in `ps -A` output."""
+    """PIDs of `uiautomator` processes listed in `ps -A -o PID,ARGS` output.
+
+    Matched on the cmdline rather than the comm name: the app_process
+    holding the UiAutomation registration is renamed to `uiautomator` only
+    after JVM init, so a young or wedged holder appears as
+    `app_process /system/bin com.android.commands.uiautomator.Launcher`."""
     pids: list[str] = []
     for line in ps_output.splitlines():
         fields = line.split()
-        if len(fields) >= 2 and fields[1].isdigit() and "uiautomator" in line:
-            pids.append(fields[1])
+        if fields and fields[0].isdigit() and "uiautomator" in line:
+            pids.append(fields[0])
     return pids
 
 
@@ -8328,7 +9225,8 @@ def _kill_orphan_uiautomators(adb: Adb) -> list[str]:
     failure is swallowed and the killed pids are only reported back.
     """
     try:
-        pids = _uiautomator_pids(adb.command("shell", "ps", "-A", timeout=15, check=False))
+        pids = _uiautomator_pids(adb.command(
+            "shell", "ps", "-A", "-o", "PID,ARGS", timeout=15, check=False))
     except Exception:
         return []
     killed: list[str] = []
@@ -8588,7 +9486,8 @@ def run_campaign(rows: Iterable[JourneyRow], *, base_url: str, serial: str,
         def restore_selected() -> None:
             after = restore_settings(adb, patch, before)
             summary["settings_after_restore"] = after
-            keys = ("wifi_on", "mobile_data", "airplane_mode_on", "font_scale", "system_locales")
+            keys = ("wifi_on", "mobile_data", "airplane_mode_on", "font_scale",
+                    "system_locales", "navigation_mode")
             summary["settings_restored"] = all(after.get(key) == before.get(key) for key in keys)
             summary["night_mode_restored"] = _night_mode_value(after.get("night_mode", "")) == _night_mode_value(before["night_mode"])
 

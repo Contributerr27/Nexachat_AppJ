@@ -355,10 +355,12 @@ class _AccountDeletionWorld:
     def tree(self):
         nodes = []
         if self.screen == "login":
-            nodes.append(_AccountDeletionNode(rid="phoneInput",
-                                             cls="android.widget.EditText"))
-            nodes.append(_AccountDeletionNode(rid="passwordInput",
-                                             cls="android.widget.EditText"))
+            nodes.append(_AccountDeletionNode(
+                rid="phoneInput", cls="android.widget.EditText",
+                text=self.login_inputs.get("phoneInput", "")))
+            nodes.append(_AccountDeletionNode(
+                rid="passwordInput", cls="android.widget.EditText",
+                text=self.login_inputs.get("passwordInput", "")))
             nodes.append(_AccountDeletionNode(text="Sign in", rid="primaryAction",
                                               cls="android.widget.Button"))
         elif self.screen == "inbox":
@@ -831,6 +833,10 @@ class WiringDecisionTest(unittest.TestCase):
                     return []
                 return [Node("Incoming voice call"), Node("Accept"), Node("Decline")]
 
+            @staticmethod
+            def grant_test_permissions():
+                return {}
+
         class Device:
             def tap_node(self, node):
                 if node.text in {"Decline", "Từ chối"}:
@@ -927,6 +933,10 @@ class WiringDecisionTest(unittest.TestCase):
             @staticmethod
             def ui_nodes(device, timeout=8):
                 return []  # peek never lands inside a uiautomator dump
+
+            @staticmethod
+            def grant_test_permissions():
+                return {}
 
         class Device:
             def tap_node(self, node):
@@ -2096,10 +2106,13 @@ class ChatInteractionsExecutorTest(unittest.TestCase):
 
         def get(self, path, token=None, params=None, headers=None):
             if path == "/api/v1/conversations":
-                return ChatInteractionsExecutorTest.Response(200, [
-                    {"id": self.direct_id, "type": "DIRECT"},
-                    {"id": self.group_id, "type": "GROUP", "title": "NexaChat Team"},
-                ])
+                # 'NexaChat Team' sits beyond page 1 of An's stale-heavy inbox;
+                # a paged fetch must never see it — the executor reads unpaged.
+                items = [{"id": self.direct_id, "type": "DIRECT"},
+                         {"id": self.group_id, "type": "GROUP", "title": "NexaChat Team"}]
+                if (params or {}).get("limit"):
+                    items = items[:1]
+                return ChatInteractionsExecutorTest.Response(200, items)
             if "/messages" in path:
                 cid = path.split("/")[4]
                 return ChatInteractionsExecutorTest.Response(
@@ -6072,17 +6085,31 @@ class OfflineSyncExecutorTest(unittest.TestCase):
     def test_executor_flags_a_single_batch_sync_as_a_defect(self):
         store, world, client, context, session = self._fixture()
         original = world.emit_sync
+        emitted = []
 
         def single_batch():
-            world.sync_log.append(
-                "I/okhttp.OkHttpClient: --> POST "
-                "http://10.0.2.2:8080/api/v1/sync (80-byte body)")
+            if not emitted:
+                emitted.append(True)
+                world.sync_log.append(
+                    "I/okhttp.OkHttpClient: --> POST "
+                    "http://10.0.2.2:8080/api/v1/sync (80-byte body)")
 
         world.emit_sync = single_batch
-        with self.assertRaises(journeys.ProductFailure) as caught:
-            self._run(context, session)
-        self.assertIn("at least two bounded batches", str(caught.exception))
-        world.emit_sync = original
+        # The constructor's cold start already emitted through the real
+        # emitter; clear it so exactly one scripted post reaches the check.
+        world.sync_log.clear()
+        # The post-marker batch window is polled now; pin it to a single
+        # read so the one scripted post still counts exactly once.
+        original_poll = journeys._OFFLINE_SYNC_POLL_S
+        journeys._OFFLINE_SYNC_POLL_S = 0
+        try:
+            with self.assertRaises(journeys.ProductFailure) as caught:
+                self._run(context, session)
+            self.assertIn("at least two bounded batches",
+                          str(caught.exception))
+        finally:
+            journeys._OFFLINE_SYNC_POLL_S = original_poll
+            world.emit_sync = original
 
     def test_executor_flags_a_seeded_row_that_never_converges(self):
         store, world, client, context, session = self._fixture()
@@ -6203,10 +6230,11 @@ E/AndroidRuntime( 9902): java.lang.IllegalStateException: truncated dump
 
 class FatalVerdictAndOrphanDumpTest(unittest.TestCase):
     PS_WITH_ORPHAN = """\
-USER           PID   PPID     VSZ    RSS WCHAN            ADDR S NAME
-root             1      0  100000    900 0                   0 S init
-shell         8871    320 2200000  40000 0                   0 S com.android.commands.uiautomator.DumpCommand
-u0_a123       5123    320 3300000  90000 0                   0 S com.nexachat.debug
+  PID ARGS
+    1 init
+ 8871 uiautomator
+ 8872 app_process /system/bin com.android.commands.uiautomator.Launcher dump /sdcard/ui.xml
+ 5123 com.nexachat.debug
 """
 
     class FakeAdb:
@@ -6249,7 +6277,10 @@ u0_a123       5123    320 3300000  90000 0                   0 S com.nexachat.de
         return {"summary": "ok"}
 
     def test_uiautomator_pids_parses_ps_output(self):
-        self.assertEqual(journeys._uiautomator_pids(self.PS_WITH_ORPHAN), ["8871"])
+        # Both the renamed `uiautomator` comm and the pre-rename
+        # `app_process ... uiautomator.Launcher` holder are caught.
+        self.assertEqual(journeys._uiautomator_pids(self.PS_WITH_ORPHAN),
+                         ["8871", "8872"])
         self.assertEqual(journeys._uiautomator_pids(""), [])
         self.assertEqual(journeys._uiautomator_pids(
             "u0_a123 5123 320 3300000 90000 0 0 S com.nexachat.debug\n"), [])
@@ -6263,8 +6294,9 @@ u0_a123       5123    320 3300000  90000 0                   0 S com.nexachat.de
             self.assertEqual(results[0]["status"], "PASS")
             calls = context["adb"].calls
             kills = [call for call in calls if call[:3] == ("shell", "kill", "-9")]
-            self.assertEqual(kills, [("shell", "kill", "-9", "8871")])
-            ps_index = calls.index(("shell", "ps", "-A"))
+            self.assertEqual(kills, [("shell", "kill", "-9", "8871"),
+                                     ("shell", "kill", "-9", "8872")])
+            ps_index = calls.index(("shell", "ps", "-A", "-o", "PID,ARGS"))
             logcat_index = calls.index(("logcat", "-d", "-v", "brief"))
             self.assertLess(ps_index, logcat_index)
 
@@ -6279,10 +6311,11 @@ u0_a123       5123    320 3300000  90000 0                   0 S com.nexachat.de
 
         with mock.patch.object(patch_window, "adb", fake_adb):
             killed = patch_window.kill_orphan_uiautomators()
-        self.assertEqual(killed, ["8871"])
+        self.assertEqual(killed, ["8871", "8872"])
         self.assertEqual(
             [call for call in calls if call[:3] == ("shell", "kill", "-9")],
-            [("shell", "kill", "-9", "8871")])
+            [("shell", "kill", "-9", "8871"),
+             ("shell", "kill", "-9", "8872")])
 
     def test_scoped_shell_crash_leaves_the_row_verdict_alone(self):
         with tempfile.TemporaryDirectory() as directory:
