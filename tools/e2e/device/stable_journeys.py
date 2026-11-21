@@ -6549,6 +6549,14 @@ def _offline_wait_conv_body(context: dict[str, Any],
                 ui.tap_node(row)
                 time.sleep(1.2)
                 continue
+            # The row can sit far below the rendered window — the fixture
+            # seeds >100 group conversations after bumping the DM, so the
+            # post-restart inbox sorts the DM deep. Sweep the list toward
+            # older rows instead of polling a viewport that never contains
+            # it; the deadline still bounds the total search.
+            if time.monotonic() >= next_scroll:
+                _offline_inbox_scroll(context)
+                next_scroll = time.monotonic() + 1.5
         else:
             message_list = next(
                 (node for node in nodes
@@ -7539,15 +7547,21 @@ def run_offline_sync(row: JourneyRow, context: dict[str, Any]) -> dict[str, Any]
         # Post-relaunch the DM row has rendered the fresh last-message text
         # as its title instead of the peer name (run-31 attempt-1); either
         # string identifies the same unambiguous row.
-        _offline_open_direct(context, title=("Binh", probe_text))
+        _offline_open_direct(
+            context, title=("Binh", probe_text) + _CHAT_TOMBSTONE_MARKERS)
         _offline_wait_conv_body(
-            context, "Binh",
+            context, ("Binh", probe_text) + _CHAT_TOMBSTONE_MARKERS,
             lambda node: probe_text in (node.text or ""),
             "the post-restart peer text did not render in the direct chat",
             timeout=60)
         last_edit = edited_to[edit_src[-1]]
+        # After the 95-message recall burst the DM row's newest activity is a
+        # tombstone, so its inbox title/preview can render "This message was
+        # deleted" instead of the peer name or the probe text — neither of
+        # the earlier aliases then matches the row (exact-match lookup) even
+        # though it is visible at the top of the list.
         _offline_wait_conv_body(
-            context, ("Binh", probe_text, last_edit),
+            context, ("Binh", probe_text, last_edit) + _CHAT_TOMBSTONE_MARKERS,
             lambda node: node.text.strip() == last_edit,
             "the reconciled tail edit was not rendered", timeout=60)
         _wait_ui_node(
