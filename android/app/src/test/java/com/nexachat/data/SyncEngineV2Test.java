@@ -422,15 +422,51 @@ public final class SyncEngineV2Test {
         assertEquals(1, requests.size());
     }
 
-    @Test public void membershipOmissionDeletesOnlyItsAccountCursorAndCachedScope() {
+    @Test public void requestedConversationAbsentFromASinglePageKeepsItsHistoryAndCursor() {
+        // Regression for the verify-285-final wipe: a conversation requested on
+        // a page but absent from that page's response must keep its local
+        // history and sync cursor. Absence is not an authoritative removal
+        // signal; only an authoritative path (leave, STOMP self-removal,
+        // inbox reconcile) may delete cached scope.
+        seed(1, 1);
+        server = request -> envelope(List.of(), 1);
+        engine.sync().blockingAwait();
+        assertNotNull("absence from one page must not wipe local history", rows.get("m-c0"));
+        assertNotNull("absence from one page must not wipe the account's sync cursor",
+                cursors.get("A:c0"));
+        verify(db.outboxDao(), never()).deleteForConversationInTransaction(anyString(), anyString());
+    }
+
+    @Test public void omittedPageThenReturnedPageResumesFromTheSameCursor() {
+        seed(1, 1);
+        AtomicInteger pages = new AtomicInteger();
+        server = request -> {
+            if (pages.incrementAndGet() == 1) return envelope(List.of(), 1); // omits c0
+            assertEquals("the follow-up page still asks from the committed cursor",
+                    1L, cursor(request.getWatermarks().get(0)));
+            return envelope(List.of(delta("c0", 2, false, message("c0", 2))), 2);
+        };
+        engine.sync().blockingAwait();
+        assertNotNull("the omitted page left the cursor in place", cursors.get("A:c0"));
+        assertEquals(1L, cursors.get("A:c0").changeCursor);
+        assertNotNull("the omitted page left the history in place", rows.get("m-c0"));
+
+        engine.sync().blockingAwait();
+        assertEquals("the returned page applies on top of the surviving row",
+                "v2", rows.get("m-c0").getContent());
+        assertEquals("the cursor advanced from the surviving position", 2L, cursors.get("A:c0").changeCursor);
+    }
+
+    @Test public void membershipOmissionDeletesNoCachedScopeAndNoAccountCursor() {
         seed(1, 1);
         cursors.put("B:other", new SyncCursorEntity("B", "other", 1, 9, null, null, null, true));
         server = request -> envelope(List.of(), 1);
         engine.sync().blockingAwait();
-        assertNull(cursors.get("A:c0"));
+        assertNotNull("omission is not authoritative: history must survive", rows.get("m-c0"));
+        assertNotNull("omission is not authoritative: the caller's cursor must survive",
+                cursors.get("A:c0"));
         assertNotNull(cursors.get("B:other"));
-        assertTrue(rows.isEmpty());
-        verify(db.outboxDao()).deleteForConversationInTransaction("c0", "A");
+        verify(db.outboxDao(), never()).deleteForConversationInTransaction(anyString(), anyString());
     }
 
     @Test public void cacheLossStartsFromZeroEvenWhenInboxSeqIsHigh() {
