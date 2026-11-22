@@ -50,6 +50,8 @@ import io.reactivex.rxjava3.disposables.CompositeDisposable;
 import io.reactivex.rxjava3.disposables.Disposable;
 import io.reactivex.rxjava3.disposables.SerialDisposable;
 import io.reactivex.rxjava3.schedulers.Schedulers;
+import io.reactivex.rxjava3.subjects.PublishSubject;
+import io.reactivex.rxjava3.subjects.Subject;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -152,7 +154,17 @@ public final class ChatViewModel extends ViewModel {
     private final SerialDisposable searchDisposable = new SerialDisposable();
     private final SerialDisposable initialHistoryDisposable = new SerialDisposable();
     private final SerialDisposable draftPersistDisposable = new SerialDisposable();
+    // Every composer-draft Room write is funneled through this single lane so a
+    // slow debounced save can never commit after a send-time clear and
+    // resurrect the sent text. Kept out of `disposables` so onCleared() can
+    // drain the queued flush instead of cancelling it mid-write.
+    private final Subject<Completable> draftWrites =
+            PublishSubject.<Completable>create().toSerialized();
+    private final Disposable draftWriteLane = draftWrites
+            .concatMapCompletable(op -> op.onErrorComplete())
+            .subscribe();
     private boolean restoringComposerDraft;
+    private boolean composerDraftMayBePersisted;
     private boolean initialHistoryReloadInFlight;
     private final Map<String, CompositeDisposable> uploadDisposables = new LinkedHashMap<>();
     /** Reply id captured when an upload batch starts, keyed by that batch's local ids. */
@@ -1331,6 +1343,7 @@ public final class ChatViewModel extends ViewModel {
                     if (!getMentionDraft().getContent().isEmpty()) {
                         return;
                     }
+                    composerDraftMayBePersisted = true;
                     restoringComposerDraft = true;
                     onComposerDraftChange(draft);
                     restoringComposerDraft = false;
@@ -1341,10 +1354,14 @@ public final class ChatViewModel extends ViewModel {
         if (composerDraftRepository == null || conversationId.isBlank() || restoringComposerDraft) {
             return;
         }
+        if (!draft.getContent().isEmpty()) {
+            composerDraftMayBePersisted = true;
+        }
         draftPersistDisposable.set(
                 Completable.timer(400, TimeUnit.MILLISECONDS, Schedulers.io())
-                        .andThen(composerDraftRepository.save(conversationId, draft))
-                        .subscribe(() -> {}, ignored -> {}));
+                        .subscribe(() -> draftWrites.onNext(
+                                composerDraftRepository.save(conversationId, draft)),
+                                ignored -> {}));
     }
 
     private void clearPersistedComposerDraft() {
@@ -1352,18 +1369,25 @@ public final class ChatViewModel extends ViewModel {
             return;
         }
         draftPersistDisposable.set(Disposable.empty());
-        disposables.add(composerDraftRepository.clear(conversationId)
-                .subscribe(() -> {}, ignored -> {}));
+        draftWrites.onNext(composerDraftRepository.clear(conversationId));
     }
 
-    private void flushComposerDraft() {
+    /**
+     * Persists the current composer draft immediately, cancelling the pending
+     * debounce. Called on pause/stop so a draft is never lost before
+     * {@link #onCleared()}. An empty draft deletes the stored row; the write is
+     * skipped entirely when nothing was ever drafted or restored.
+     */
+    public void flushComposerDraft() {
         if (composerDraftRepository == null || conversationId.isBlank()) {
             return;
         }
+        MentionDraft draft = getMentionDraft();
+        if (draft.getContent().isEmpty() && !composerDraftMayBePersisted) {
+            return;
+        }
         draftPersistDisposable.set(Disposable.empty());
-        composerDraftRepository.save(conversationId, getMentionDraft())
-                .subscribeOn(Schedulers.io())
-                .subscribe(() -> {}, ignored -> {});
+        draftWrites.onNext(composerDraftRepository.save(conversationId, draft));
     }
 
     private SavedStateHandle savedState() {
@@ -2189,6 +2213,9 @@ public final class ChatViewModel extends ViewModel {
     @Override
     protected void onCleared() {
         flushComposerDraft();
+        // Completing upstream drains every queued draft write through the lane
+        // before it terminates, so the final flush still reaches Room.
+        draftWrites.onComplete();
         disposables.clear();
         uploadDisposables.clear();
         attachmentReplyIds.clear();

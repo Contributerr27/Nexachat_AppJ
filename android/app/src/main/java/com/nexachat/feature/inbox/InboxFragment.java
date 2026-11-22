@@ -35,6 +35,7 @@ import com.google.android.material.snackbar.Snackbar;
 import com.nexachat.R;
 import com.nexachat.core.common.ApiError;
 import com.nexachat.core.network.dto.UserDto;
+import com.nexachat.core.ui.SnackbarDurations;
 import com.nexachat.data.ConversationSummary;
 import com.nexachat.databinding.FragmentInboxBinding;
 import com.nexachat.feature.chat.ChatErrorIds;
@@ -201,13 +202,16 @@ public final class InboxFragment extends Fragment {
                 Snackbar.make(binding.getRoot(),
                                 ChatErrorIds.messageId(failure.getError()),
                                 Snackbar.LENGTH_LONG)
+                        .setAnchorView(binding.createGroupFab)
                         .show();
                 return;
             }
             if (event instanceof InboxPreferenceSuccess success) {
                 Snackbar snackbar = Snackbar.make(
-                        binding.getRoot(), success.getMessageId(), Snackbar.LENGTH_LONG);
+                        binding.getRoot(), success.getMessageId(), Snackbar.LENGTH_LONG)
+                        .setAnchorView(binding.createGroupFab);
                 if (success.getUndo() != null) {
+                    snackbar.setDuration(SnackbarDurations.UNDO_MS);
                     snackbar.setAction(R.string.action_undo, ignored -> success.getUndo().run());
                 }
                 snackbar.show();
@@ -220,6 +224,7 @@ public final class InboxFragment extends Fragment {
                                         ? getString(R.string.inbox_removed_from_group)
                                         : getString(R.string.inbox_removed_from_group_named, groupTitle),
                                 Snackbar.LENGTH_LONG)
+                        .setAnchorView(binding.createGroupFab)
                         .show();
             }
         });
@@ -559,18 +564,27 @@ public final class InboxFragment extends Fragment {
         if (adapter.getCurrentList().equals(rows)) return;
         int firstPosition = layoutManager == null ? RecyclerView.NO_POSITION
                 : layoutManager.findFirstVisibleItemPosition();
+        // A row restored at the very top (archive undo, a newer message bump)
+        // must become visible: re-anchoring to the displaced first item leaves
+        // it one row-height above the viewport — submitted but never laid out.
+        boolean atTop = firstPosition <= 0;
         String anchorId = null;
         int anchorOffset = 0;
-        if (firstPosition != RecyclerView.NO_POSITION && firstPosition < adapter.getItemCount()) {
+        if (!atTop && firstPosition < adapter.getItemCount()) {
             anchorId = adapter.getCurrentList().get(firstPosition).getId();
             View anchor = layoutManager.findViewByPosition(firstPosition);
             if (anchor != null) anchorOffset = anchor.getTop() - binding.conversationList.getPaddingTop();
         }
         final String preservedId = anchorId;
         final int preservedOffset = anchorOffset;
+        final boolean scrollToTop = atTop;
         adapter.submitList(rows, () -> {
             if (binding == null) return;
-            if (preservedId != null && layoutManager != null) {
+            if (scrollToTop) {
+                if (layoutManager != null) {
+                    layoutManager.scrollToPositionWithOffset(0, binding.conversationList.getPaddingTop());
+                }
+            } else if (preservedId != null && layoutManager != null) {
                 List<ConversationSummary> current = adapter.getCurrentList();
                 for (int i = 0; i < current.size(); i++) {
                     if (preservedId.equals(current.get(i).getId())) {
@@ -618,6 +632,7 @@ public final class InboxFragment extends Fragment {
         if (lastPaginationErrorMessageId == messageId || binding == null) return;
         lastPaginationErrorMessageId = messageId;
         Snackbar.make(binding.getRoot(), messageId, Snackbar.LENGTH_LONG)
+                .setAnchorView(binding.createGroupFab)
                 .setAction(R.string.action_retry, ignored -> viewModel.loadNextPage())
                 .show();
     }
