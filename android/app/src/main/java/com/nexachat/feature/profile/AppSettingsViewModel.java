@@ -17,17 +17,27 @@ public final class AppSettingsViewModel extends ViewModel {
     private final SettingsRepository settingsRepository;
     private final MutableLiveData<ThemeMode> themeMode = new MutableLiveData<>(ThemeMode.SYSTEM);
     private final MutableLiveData<ChatColor> chatColor = new MutableLiveData<>(ChatColor.PLUM);
+    /**
+     * Seeded synchronously: a FALSE placeholder would reach the host's
+     * observer before the posted stored value and force a needless recreate
+     * on every cold start with pure black enabled.
+     */
+    private final MutableLiveData<Boolean> amoledBlack;
     private final CompositeDisposable disposables = new CompositeDisposable();
 
     @Inject
     public AppSettingsViewModel(SettingsRepository settingsRepository) {
         this.settingsRepository = settingsRepository;
+        this.amoledBlack = new MutableLiveData<>(settingsRepository.isAmoledBlack());
         disposables.add(
                 settingsRepository.getThemeMode()
                         .subscribe(themeMode::postValue, ignored -> { }));
         disposables.add(
                 settingsRepository.getChatColor()
                         .subscribe(chatColor::postValue, ignored -> { }));
+        disposables.add(
+                settingsRepository.getAmoledBlack()
+                        .subscribe(amoledBlack::postValue, ignored -> { }));
     }
 
     public LiveData<ThemeMode> getThemeMode() {
@@ -44,6 +54,14 @@ public final class AppSettingsViewModel extends ViewModel {
 
     public void setChatColor(ChatColor color) {
         settingsRepository.setChatColor(color);
+    }
+
+    public LiveData<Boolean> getAmoledBlack() {
+        return amoledBlack;
+    }
+
+    public void setAmoledBlack(boolean enabled) {
+        settingsRepository.setAmoledBlack(enabled);
     }
 
     @Override
