@@ -6,6 +6,28 @@ All notable changes to NexaChat are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.21] - 2026-11-24
+
+Server + Android release. See
+[docs/release-notes/v1.2.21.md](docs/release-notes/v1.2.21.md).
+
+### Added
+- Server: AI answers are bound to a conversation context revision
+  (`ai_context_version`, migration `V47`); message writes, opt-outs and
+  e2ee changes invalidate stale Ask/Summary cache entries, and
+  consent/exclusion reads serialize under `FOR SHARE`.
+
+### Performance
+- Server: ~35% lower median realtime latency — cached per-frame token
+  validity probe (authoritative revocation fence unchanged), dedicated
+  STOMP executor pools, one JSON parse per delivered frame, batched FCM
+  token loading, and `UPDATE...RETURNING` change-version allocation.
+
+### Fixed
+- Android: mute-forever toast shows the correct label.
+- Server: retention tombstone purge and account-deletion AI scrub lock
+  conversations parent-first, removing a V47 deadlock pairing.
+
 ## [1.2.20] - 2026-11-23
 
 Android-only patch release. See
