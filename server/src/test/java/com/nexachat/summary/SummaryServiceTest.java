@@ -18,6 +18,8 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.LinkedHashSet;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -75,6 +77,22 @@ class SummaryServiceTest {
         service = new SummaryService(rateLimiter, windowService, providerSelector, cacheRepository,
                 ConversationAiOptOuts.none(), Clock.systemUTC(), 120_000L, consentRepository,
                 new SummaryConsentRecheck(consentRepository, transactionManager));
+    }
+
+    @Test
+    void externalContentHashNamesTheCompleteSortedExclusionSetAndPreservesEmptyIdentity() {
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        Set<UUID> forward = new LinkedHashSet<>(List.of(first, second));
+        Set<UUID> reverse = new LinkedHashSet<>(List.of(second, first));
+        String empty = SummaryService.contentHash(window, request(false), null, 0L, Set.of());
+        String both = SummaryService.contentHash(window, request(false), null, 0L, forward);
+
+        assertThat(empty).isEqualTo(hash("LLM"));
+        assertThat(both).isEqualTo(SummaryService.contentHash(window, request(false), null, 0L, reverse));
+        assertThat(both).isNotEqualTo(empty)
+                .isNotEqualTo(SummaryService.contentHash(window, request(false), null, 0L, Set.of(first)))
+                .isNotEqualTo(SummaryService.contentHash(window, request(false), null, 0L, Set.of(second)));
     }
 
     @Test
@@ -139,12 +157,125 @@ class SummaryServiceTest {
     }
 
     @Test
+    void cachedExternalSummaryRejectsConsentMovementWithoutCallingProvider() {
+        SummaryRequest request = request(false);
+        PreparedSummaryProvider prepared = new PreparedSummaryProvider(new StubProvider("LLM"), "LLM", null);
+        when(windowService.load(conversationId, userId, request))
+                .thenReturn(new SummaryReadContext(window, true, 0L, null));
+        when(providerSelector.prepare(eq(true), any(), anyBoolean())).thenReturn(prepared);
+        when(cacheRepository.findValid(conversationId, window.fromSeq(), window.toSeq(),
+                hash("LLM"), "LLM", SummaryLanguage.EN))
+                .thenReturn(Optional.of(cacheEntry(generation("LLM", "Cached external", null), "LLM")));
+        // A revoke followed by a regrant still invalidates the read epoch.
+        when(consentRepository.lockForResponse(userId))
+                .thenReturn(new SummaryConsentRepository.ConsentSnapshot(true, 2L));
+
+        assertThatThrownBy(() -> service.summarize(conversationId, userId, request))
+                .isInstanceOfSatisfying(ApiException.class,
+                        ex -> assertThat(ex.getCode()).isEqualTo(ApiErrorCode.AI_CONSENT_REQUIRED));
+        verify(providerSelector, never()).generate(any(), any(), any());
+    }
+
+    @Test
+    void cachedExternalSummaryWithUnchangedConsentUsesResponseLock() {
+        SummaryRequest request = request(false);
+        PreparedSummaryProvider prepared = new PreparedSummaryProvider(new StubProvider("LLM"), "LLM", null);
+        when(windowService.load(conversationId, userId, request))
+                .thenReturn(new SummaryReadContext(window, true, 0L, null));
+        when(providerSelector.prepare(eq(true), any(), anyBoolean())).thenReturn(prepared);
+        when(cacheRepository.findValid(conversationId, window.fromSeq(), window.toSeq(),
+                hash("LLM"), "LLM", SummaryLanguage.EN))
+                .thenReturn(Optional.of(cacheEntry(generation("LLM", "Cached external", null), "LLM")));
+
+        SummaryResponse response = service.summarize(conversationId, userId, request);
+
+        assertThat(response.cached()).isTrue();
+        assertThat(response.overview()).isEqualTo("Cached external");
+        verify(consentRepository).lockForResponse(userId);
+        verify(providerSelector, never()).generate(any(), any(), any());
+    }
+
+    @Test
+    void waiterRechecksItsReadConsentAfterTheLeaderFillsTheCache() throws Exception {
+        SummaryRequest request = request(false);
+        UUID waiterId = UUID.randomUUID();
+        PreparedSummaryProvider prepared = new PreparedSummaryProvider(new StubProvider("LLM"), "LLM", null);
+        SummaryGeneration generated = generation("LLM", "Leader output", null);
+        SummaryCacheEntry entry = cacheEntry(generated, "LLM");
+        AtomicReference<SummaryCacheEntry> cached = new AtomicReference<>();
+        AtomicReference<SummaryConsentRepository.ConsentSnapshot> waiterConsent = new AtomicReference<>(
+                new SummaryConsentRepository.ConsentSnapshot(true, 0L));
+        CountDownLatch providerStarted = new CountDownLatch(1);
+        CountDownLatch releaseProvider = new CountDownLatch(1);
+        CountDownLatch waiterProbed = new CountDownLatch(1);
+        when(windowService.load(eq(conversationId), any(), eq(request)))
+                .thenReturn(new SummaryReadContext(window, true, 0L, null));
+        when(providerSelector.prepare(eq(true), any(), anyBoolean())).thenReturn(prepared);
+        when(consentRepository.lockForResponse(waiterId)).thenAnswer(invocation -> waiterConsent.get());
+        when(cacheRepository.findValid(eq(conversationId), anyLong(), anyLong(), eq(hash("LLM")),
+                eq("LLM"), eq(SummaryLanguage.EN))).thenAnswer(invocation -> {
+                    if (Thread.currentThread().getName().equals("consent-cache-waiter")) {
+                        waiterProbed.countDown();
+                    }
+                    return Optional.ofNullable(cached.get());
+                });
+        when(providerSelector.generate(prepared, window, SummaryLanguage.EN)).thenAnswer(invocation -> {
+            providerStarted.countDown();
+            assertThat(releaseProvider.await(5, TimeUnit.SECONDS)).isTrue();
+            return generated;
+        });
+        when(cacheRepository.saveIfAbsent(eq(userId), eq(conversationId), eq(window), eq(hash("LLM")),
+                eq("LLM"), eq(SummaryLanguage.EN), eq(generated))).thenAnswer(invocation -> {
+                    cached.set(entry);
+                    return new SummaryCacheRepository.SavedSummary(entry, true);
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        AtomicReference<Throwable> waiterFailure = new AtomicReference<>();
+        Thread waiter = new Thread(() -> {
+            try {
+                service.summarize(conversationId, waiterId, request);
+            } catch (Throwable failure) {
+                waiterFailure.set(failure);
+            }
+        }, "consent-cache-waiter");
+        try {
+            Future<SummaryResponse> leader = executor.submit(() -> service.summarize(conversationId, userId, request));
+            assertThat(providerStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            waiter.start();
+            assertThat(waiterProbed.await(5, TimeUnit.SECONDS)).isTrue();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (waiter.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertThat(waiter.getState()).isEqualTo(Thread.State.TIMED_WAITING);
+            waiterConsent.set(new SummaryConsentRepository.ConsentSnapshot(false, 1L));
+            releaseProvider.countDown();
+            assertThat(leader.get(5, TimeUnit.SECONDS).overview()).isEqualTo("Leader output");
+            waiter.join(5_000);
+            assertThat(waiter.isAlive()).isFalse();
+            assertThat(waiterFailure.get()).isInstanceOfSatisfying(ApiException.class,
+                    ex -> assertThat(ex.getCode()).isEqualTo(ApiErrorCode.AI_CONSENT_REQUIRED));
+            verify(providerSelector, times(1)).generate(any(), any(), any());
+        } finally {
+            releaseProvider.countDown();
+            waiter.interrupt();
+            waiter.join(5_000);
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
     void cacheHitReflectsCurrentConsentFallbackAndSkipsProviderCall() {
         SummaryRequest request = request(false);
         PreparedSummaryProvider prepared = new PreparedSummaryProvider(
                 new StubProvider("LOCAL"), "LOCAL", SummaryFallbackReason.NO_CONSENT);
         SummaryGeneration previouslyGenerated = generation("LOCAL", "Stored output", null);
         SummaryCacheEntry entry = cacheEntry(previouslyGenerated, "LOCAL");
+        ConversationAiOptOuts exclusions = mock(ConversationAiOptOuts.class);
+        when(exclusions.optedOutUserIds(conversationId)).thenReturn(Set.of(), Set.of(userId));
+        service = new SummaryService(rateLimiter, windowService, providerSelector, cacheRepository,
+                exclusions, Clock.systemUTC(), 120_000L, consentRepository,
+                new SummaryConsentRecheck(consentRepository, transactionManager));
         when(windowService.load(conversationId, userId, request))
                 .thenReturn(new SummaryReadContext(window, false, 0L, null));
         when(providerSelector.prepare(org.mockito.ArgumentMatchers.eq(false), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean())).thenReturn(prepared);
@@ -157,8 +288,50 @@ class SummaryServiceTest {
         assertThat(response.cached()).isTrue();
         assertThat(response.generatedBy()).isEqualTo("LOCAL");
         assertThat(response.fallbackReason()).isEqualTo("NO_CONSENT");
+        verify(consentRepository, never()).lockForResponse(any());
         verify(providerSelector, never()).generate(org.mockito.ArgumentMatchers.any(),
                 org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void consentMovementDuringOwnCacheInsertSuppressesTheExternalResponse() {
+        assertOwnSaveConsentMovementSuppressed(false);
+    }
+
+    @Test
+    void consentMovementDuringRefreshReplaceSuppressesTheExternalResponse() {
+        assertOwnSaveConsentMovementSuppressed(true);
+    }
+
+    private void assertOwnSaveConsentMovementSuppressed(boolean refresh) {
+        SummaryRequest request = request(refresh);
+        PreparedSummaryProvider prepared = new PreparedSummaryProvider(new StubProvider("LLM"), "LLM", null);
+        SummaryGeneration generated = generation("LLM", "External own output", null);
+        SummaryCacheEntry entry = cacheEntry(generated, "LLM");
+        AtomicReference<SummaryConsentRepository.ConsentSnapshot> consent = new AtomicReference<>(
+                new SummaryConsentRepository.ConsentSnapshot(true, 0L));
+        when(windowService.load(conversationId, userId, request))
+                .thenReturn(new SummaryReadContext(window, true, 0L, null));
+        when(providerSelector.prepare(eq(true), any(), anyBoolean())).thenReturn(prepared);
+        when(providerSelector.generate(prepared, window, SummaryLanguage.EN)).thenReturn(generated);
+        when(consentRepository.lockForResponse(userId)).thenAnswer(invocation -> consent.get());
+        if (refresh) {
+            when(cacheRepository.replace(any(), any(), any(), anyString(), eq("LLM"), any(), eq(generated)))
+                    .thenAnswer(invocation -> {
+                        consent.set(new SummaryConsentRepository.ConsentSnapshot(false, 1L));
+                        return entry;
+                    });
+        } else {
+            when(cacheRepository.saveIfAbsent(any(), any(), any(), anyString(), eq("LLM"), any(), eq(generated)))
+                    .thenAnswer(invocation -> {
+                        consent.set(new SummaryConsentRepository.ConsentSnapshot(false, 1L));
+                        return new SummaryCacheRepository.SavedSummary(entry, true);
+                    });
+        }
+
+        assertThatThrownBy(() -> service.summarize(conversationId, userId, request))
+                .isInstanceOfSatisfying(ApiException.class,
+                        ex -> assertThat(ex.getCode()).isEqualTo(ApiErrorCode.AI_CONSENT_REQUIRED));
     }
 
     @Test
@@ -235,7 +408,7 @@ class SummaryServiceTest {
 
         assertThat(response.overview()).isEqualTo("External output");
         assertThat(response.cached()).isFalse();
-        verify(consentRepository).lockForResponse(userId);
+        verify(consentRepository, times(2)).lockForResponse(userId);
         verify(cacheRepository).saveIfAbsent(eq(userId), eq(conversationId), eq(window), eq(hash("LLM")),
                 eq("LLM"), eq(SummaryLanguage.EN), eq(generated));
     }

@@ -2,6 +2,7 @@ package com.nexachat.rag;
 
 import com.nexachat.common.error.ApiErrorCode;
 import com.nexachat.common.error.ApiException;
+import com.nexachat.conversation.Conversation;
 import com.nexachat.conversation.ConversationMemberRepository;
 import com.nexachat.conversation.ConversationRepository;
 import com.nexachat.summary.SummaryConsentRepository;
@@ -15,6 +16,7 @@ import java.time.Clock;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -61,6 +63,8 @@ class AskServiceTest {
         when(memberRepository.findJoinedAt(conversationId, userId)).thenReturn(java.util.Optional.of(java.time.Instant.EPOCH));
         setConsent(false);
         when(questionCache.citationsValid(any(), any())).thenReturn(true);
+        when(questionCache.contextSnapshot(any())).thenReturn(new RagQuestionCache.ContextSnapshot(1, null));
+        when(questionCache.contextUnchanged(any(), any())).thenReturn(true);
     }
 
     @Test
@@ -81,6 +85,31 @@ class AskServiceTest {
                 .isInstanceOf(ApiException.class)
                 .satisfies(throwable -> assertThat(((ApiException) throwable).getCode())
                         .isEqualTo(ApiErrorCode.CONVERSATION_NOT_FOUND));
+    }
+
+    @Test
+    void e2eeActivationDuringSnapshotCaptureStopsAllProviderWork() {
+        AtomicBoolean encrypted = new AtomicBoolean(false);
+        Conversation conversation = mock(Conversation.class);
+        when(conversationRepository.findById(conversationId)).thenReturn(Optional.of(conversation));
+        when(conversation.isE2eeEnabled()).thenAnswer(invocation -> encrypted.get());
+        when(questionCache.contextSnapshot(conversationId)).thenAnswer(invocation -> {
+            encrypted.set(true);
+            return new RagQuestionCache.ContextSnapshot(2, null);
+        });
+        RagEmbeddingService provider = mock(RagEmbeddingService.class);
+        RagRetrievalService retriever = mock(RagRetrievalService.class);
+        AskService guarded = new AskService(rateLimiter, conversationRepository, memberRepository,
+                consentRepository, provider, retriever, questionCache, llmAnswerService,
+                properties, stats, Clock.systemUTC());
+
+        assertThatThrownBy(() -> guarded.ask(conversationId, userId, new AskRequest("Hello?", null)))
+                .isInstanceOf(ApiException.class)
+                .satisfies(throwable -> assertThat(((ApiException) throwable).getCode())
+                        .isEqualTo(ApiErrorCode.E2EE_AI_UNAVAILABLE));
+        verify(provider, never()).embedQuestion(any(), anyBoolean());
+        verify(questionCache, never()).findExact(any(), any(), any());
+        verify(llmAnswerService, never()).answer(any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -164,7 +193,7 @@ class AskServiceTest {
         RagQuestionCache.CachedAsk cached = new RagQuestionCache.CachedAsk(
                 "The budget is 1,200 dollars.",
                 List.of(new RagCitation(fact.id(), 1, "The budget is 1,200 dollars.")),
-                "EXTRACTIVE", List.of(fact.id()), "hash", SummaryLanguage.EN);
+                "EXTRACTIVE", List.of(fact.id()), "hash", SummaryLanguage.EN, 1);
         setConsent(true);
         when(questionCache.findExact(any(), any(), any())).thenReturn(Optional.of(cached));
 
@@ -184,7 +213,7 @@ class AskServiceTest {
         RagQuestionCache.CachedAsk cached = new RagQuestionCache.CachedAsk(
                 "Provider answer from another member's consented request.",
                 List.of(new RagCitation(fact.id(), fact.seq(), fact.content())),
-                "LLM", List.of(fact.id()), "hash", SummaryLanguage.EN);
+                "LLM", List.of(fact.id()), "hash", SummaryLanguage.EN, 1);
         when(questionCache.findExact(any(), any(), any())).thenReturn(Optional.of(cached));
 
         AskResponse response = service.ask(conversationId, userId,
@@ -205,7 +234,7 @@ class AskServiceTest {
         RagQuestionCache.CachedAsk cached = new RagQuestionCache.CachedAsk(
                 "La migration est le 14 mars.",
                 List.of(new RagCitation(fact.id(), 1, fact.content())),
-                "EXTRACTIVE", List.of(fact.id()), "hash", SummaryLanguage.VI);
+                "EXTRACTIVE", List.of(fact.id()), "hash", SummaryLanguage.VI, 1);
         setConsent(true);
         when(questionCache.findExact(any(), any(), any())).thenReturn(Optional.of(cached));
 
@@ -224,7 +253,7 @@ class AskServiceTest {
         RagQuestionCache.CachedAsk cached = new RagQuestionCache.CachedAsk(
                 "La migration est le 14 mars.",
                 List.of(new RagCitation(fact.id(), 1, fact.content())),
-                "EXTRACTIVE", List.of(fact.id()), "hash", SummaryLanguage.VI);
+                "EXTRACTIVE", List.of(fact.id()), "hash", SummaryLanguage.VI, 1);
         setConsent(true);
         RagEmbeddingService.EmbeddingOutcome embedding = embeddings.embedQuestion(question, false);
         when(questionCache.findExact(any(), any(), any())).thenReturn(Optional.empty());
@@ -262,7 +291,7 @@ class AskServiceTest {
         RagQuestionCache.CachedAsk cached = new RagQuestionCache.CachedAsk(
                 "Unrelated cached answer about Tuesday lunch.",
                 List.of(new RagCitation(fact.id(), 1, fact.content())),
-                "LLM", List.of(fact.id()), "hash", SummaryLanguage.EN);
+                "LLM", List.of(fact.id()), "hash", SummaryLanguage.EN, 1);
         setConsent(true);
         RagEmbeddingService.EmbeddingOutcome embedding = embeddings.embedQuestion(question, false);
         when(questionCache.findExact(any(), any(), any())).thenReturn(Optional.empty());
